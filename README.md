@@ -1,14 +1,6 @@
-# Project
+# ETW Tools and Libraries
 
-> This repo has been populated by an initial template to help get you started. Please
-> make sure to update the content to build a great experience for community-building.
-
-As the maintainer of this project, please make a few updates:
-
-- Improving this README.MD file to provide a great experience
-- Updating SUPPORT.MD with content about this project's support experience
-- Understanding the security reporting process in SECURITY.MD
-- Remove this section from the README
+This project contains various tools and samples for using ETW (Event Tracing for Windows). They can be used as a reference for solving similar problems in your own code, or used wholesale by your project. Please refer to the README files in each subdirectory for more details on what the code there does and how to use it.
 
 ## Contributing
 
