@@ -9,11 +9,8 @@ use std::{
 use futures::{SinkExt, StreamExt};
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 
-use crate::event_record::EventRecord;
+use crate::{event_record::EventRecord, error::*};
 use crate::processtrace::*;
-
-#[allow(overflowing_literals)]
-static E_CANCELLED: windows::core::HRESULT = windows::core::HRESULT(0x800704c7);
 
 struct FuturesChannelConsumer {
     tx: Mutex<futures::channel::mpsc::Sender<AtomicPtr<EVENT_RECORD>>>,
@@ -35,34 +32,32 @@ impl EventConsumer for FuturesChannelConsumer {
     }
 
     fn complete(&self, _err: windows::core::Error) {
-        futures::executor::block_on(async {
-            let _ = self.tx.lock().unwrap().close();
-        });
+        let _ = futures::executor::block_on(
+            self.tx.lock().unwrap().close()
+        );
     }
 }
 
-#[allow(dead_code)]
 pub struct EtwEventAsyncWaiter {
     rx: RefCell<futures::channel::mpsc::Receiver<AtomicPtr<EVENT_RECORD>>>,
     consumer: Option<FuturesChannelConsumer>,
 }
 
-impl EtwEventAsyncWaiter {
-    #[allow(dead_code)]
-    pub fn new() -> EtwEventAsyncWaiter {
+impl Default for EtwEventAsyncWaiter {
+    fn default() -> Self {
         let (tx, rx) = futures::channel::mpsc::channel::<AtomicPtr<EVENT_RECORD>>(0);
         EtwEventAsyncWaiter {
             rx: RefCell::new(rx),
             consumer: Some(FuturesChannelConsumer { tx: Mutex::new(tx) }),
         }
     }
+}
 
-    #[allow(dead_code)]
+impl EtwEventAsyncWaiter {
     pub fn get_consumer(&mut self) -> impl EventConsumer {
         self.consumer.take().unwrap()
     }
 
-    #[allow(dead_code)]
     pub fn expect_event<F>(&self, f: F) -> Result<(), windows::core::Error>
     where
         F: Fn(EventRecord) -> bool + Send + Sync,
@@ -70,11 +65,12 @@ impl EtwEventAsyncWaiter {
         futures::executor::block_on(self.expect_event_async(f))
     }
 
-    #[allow(dead_code)]
     pub async fn expect_event_async<F>(&self, f: F) -> Result<(), windows::core::Error>
     where
         F: Fn(EventRecord) -> bool + Send + Sync,
     {
+        // A ref to rx is only held in this single function
+        #[allow(clippy::await_holding_refcell_ref)]
         let next_event = self.rx.borrow_mut().next().await;
         let next_event_record = EventRecord::new(next_event.unwrap().load(Ordering::Acquire));
 
@@ -83,14 +79,14 @@ impl EtwEventAsyncWaiter {
             self.rx.borrow_mut().close();
         }
 
-        return Ok::<(), windows::core::Error>(());
+        Ok::<(), windows::core::Error>(())
     }
 }
 
 #[cfg(test)]
 #[allow(non_upper_case_globals)]
 mod tests {
-    use crate::EtwSession;
+    use crate::{FileMode, SessionBuilder};
     use futures::TryFutureExt;
     use rsevents::Awaitable;
     use std::ffi::c_void;
@@ -118,8 +114,7 @@ mod tests {
 
     #[test]
     fn consume_event() -> Result<(), windows::core::Error> {
-        const sz_test_name: windows::core::PCSTR =
-            windows::s!("EtwConsumer-Rust-Tests-ConsumeEvent-Futures");
+        const test_name: &str = "EtwConsumer-Rust-Tests-ConsumeEvent-Futures";
 
         let mut options = tracelogging_dynamic::Provider::options();
         let options = options.callback(
@@ -137,13 +132,20 @@ mod tests {
         let provider_guid = windows::core::GUID::from_u128(provider.id().to_u128());
         let mut eb = tracelogging_dynamic::EventBuilder::new();
 
-        let h = EtwSession::get_or_start_etw_session(sz_test_name, true)?;
+        let h = SessionBuilder::new_file_mode(
+            "EtwConsumer-Rust-Tests-ConsumeEvent-Futures",
+            "futcb.etl",
+            FileMode::Sequential,
+        )
+        .realtime_event_delivery()
+        .start(true)?;
+
         h.enable_provider(&provider_guid)?;
 
-        let mut consumer = EtwEventAsyncWaiter::new();
+        let mut consumer = EtwEventAsyncWaiter::default();
         let event_consumer = consumer.get_consumer();
 
-        let trace = ProcessTraceHandle::from_session(sz_test_name, event_consumer)?;
+        let trace = ProcessTraceHandle::from_session(test_name, event_consumer)?;
 
         consume_event_enabled_event.wait();
 

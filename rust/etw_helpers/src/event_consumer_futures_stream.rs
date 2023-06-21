@@ -3,16 +3,16 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicPtr, Ordering},
-        Arc, Mutex, Condvar,
+        Arc, Condvar, Mutex,
     },
 };
 
 use futures::{task, Stream};
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 
+use crate::error::*;
 use crate::event_record::EventRecord;
 use crate::processtrace::*;
-use crate::error::*;
 
 struct EtwEventStreamInner<'a> {
     waker: Mutex<Option<task::Waker>>,
@@ -24,12 +24,12 @@ struct EtwEventStreamInner<'a> {
 impl<'a> EventConsumer for EtwEventStreamConsumer<'a> {
     unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), windows::core::Error> {
         let mut guard = self.inner.next_event.lock().unwrap();
-        if guard.load(Ordering::Acquire) != core::ptr::null_mut() {
+        if !guard.load(Ordering::Acquire).is_null() {
             let res = self.inner.consumer_complete.wait(guard);
-            if res.is_ok() {
-                guard = res.unwrap();
+            if let Ok(x) = res {
+                guard = x;
             } else {
-                return Err(E_UNEXPECTED.into())
+                return Err(E_UNEXPECTED.into());
             }
         }
 
@@ -58,14 +58,14 @@ impl<'a> Stream for EtwEventStreamExt<'a> {
         *self.inner.waker.lock().unwrap() = Some(cx.waker().clone());
         let guard = self.inner.next_event.lock().unwrap();
         let ptr = guard.load(Ordering::Acquire);
-        if ptr == core::ptr::null_mut() {
+        if ptr.is_null() {
             task::Poll::Pending
         } else if ptr == (12345 as *mut EVENT_RECORD) {
             task::Poll::Ready(None)
         } else {
             let evt = guard.load(Ordering::Acquire);
             guard.store(core::ptr::null_mut(), Ordering::Release);
-            let result = task::Poll::Ready(Some(EventRecord::new(evt).to_owned()));
+            let result = task::Poll::Ready(Some(EventRecord::new(evt)));
             self.inner.consumer_complete.notify_all();
             result
         }
@@ -80,14 +80,12 @@ pub struct EtwEventStreamExt<'a> {
     inner: Arc<EtwEventStreamInner<'a>>,
 }
 
-#[allow(dead_code)]
 pub struct EtwEventAsyncStream<'a> {
     inner: Arc<EtwEventStreamInner<'a>>,
 }
 
-impl<'a> EtwEventAsyncStream<'a> {
-    #[allow(dead_code)]
-    pub fn new() -> EtwEventAsyncStream<'a> {
+impl<'a> Default for EtwEventAsyncStream<'a> {
+    fn default() -> Self {
         EtwEventAsyncStream {
             inner: Arc::new(EtwEventStreamInner {
                 waker: Mutex::new(None),
@@ -97,15 +95,15 @@ impl<'a> EtwEventAsyncStream<'a> {
             }),
         }
     }
+}
 
-    #[allow(dead_code)]
+impl<'a> EtwEventAsyncStream<'a> {
     pub fn get_consumer(&self) -> impl EventConsumer + 'a {
         EtwEventStreamConsumer {
             inner: self.inner.clone(),
         }
     }
 
-    #[allow(dead_code)]
     pub fn get_stream(&self) -> impl Stream + 'a {
         EtwEventStreamExt {
             inner: self.inner.clone(),
@@ -116,15 +114,14 @@ impl<'a> EtwEventAsyncStream<'a> {
 #[cfg(test)]
 #[allow(non_upper_case_globals)]
 mod tests {
-    use crate::EtwSession;
+    use crate::{FileMode, SessionBuilder};
     use futures::StreamExt;
 
     use super::*;
 
     #[tokio::test]
     async fn stream_events() -> Result<(), windows::core::Error> {
-        const sz_test_name: windows::core::PCSTR =
-            windows::s!("EtwConsumer-Rust-Tests-StreamEvent");
+        const test_name: &str = "EtwConsumer-Rust-Tests-StreamEvent";
 
         let provider = Box::pin(tracelogging_dynamic::Provider::new(
             "stream_event_test",
@@ -136,14 +133,21 @@ mod tests {
         let provider_guid = windows::core::GUID::from_u128(provider.id().to_u128());
         let mut eb = tracelogging_dynamic::EventBuilder::new();
 
-        let h = EtwSession::get_or_start_etw_session(sz_test_name, true)?;
+        let h = SessionBuilder::new_file_mode(
+            "EtwConsumer-Rust-Tests-StreamEvent",
+            "strm.etl",
+            FileMode::Sequential,
+        )
+        .realtime_event_delivery()
+        .start(true)?;
+
         h.enable_provider(&provider_guid)?;
 
-        let etw_event_stream = EtwEventAsyncStream::new();
+        let etw_event_stream = EtwEventAsyncStream::default();
         let event_consumer = etw_event_stream.get_consumer();
         let event_stream = etw_event_stream.get_stream();
 
-        let trace = ProcessTraceHandle::from_session(sz_test_name, event_consumer)?;
+        let trace = ProcessTraceHandle::from_session(test_name, event_consumer)?;
 
         let mut thread = trace.process_trace()?;
 

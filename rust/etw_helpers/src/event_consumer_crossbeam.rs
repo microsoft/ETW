@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use crossbeam_channel::select;
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 
-use crate::event_record::EventRecord;
 use crate::error::*;
+use crate::event_record::EventRecord;
 use crate::processtrace::*;
 
 struct CrossbeamChannelConsumer {
@@ -38,7 +38,6 @@ impl EventConsumer for CrossbeamChannelConsumer {
     }
 }
 
-#[allow(dead_code)]
 pub struct EtwEventWaiter {
     rx: crossbeam_channel::Receiver<AtomicPtr<EVENT_RECORD>>,
     callback_tx: crossbeam_channel::Sender<windows::core::HRESULT>,
@@ -46,9 +45,8 @@ pub struct EtwEventWaiter {
     consumer: Option<CrossbeamChannelConsumer>,
 }
 
-impl EtwEventWaiter {
-    #[allow(dead_code)]
-    pub fn new() -> EtwEventWaiter {
+impl Default for EtwEventWaiter {
+    fn default() -> Self {
         let (tx, rx) = crossbeam_channel::bounded::<AtomicPtr<EVENT_RECORD>>(0);
         let (callback_tx, callback_rx) = crossbeam_channel::bounded::<windows::core::HRESULT>(1);
         let (session_closed_tx, session_closed_rx) =
@@ -65,13 +63,13 @@ impl EtwEventWaiter {
             }),
         }
     }
+}
 
-    #[allow(dead_code)]
+impl EtwEventWaiter {
     pub fn get_consumer(&mut self) -> impl EventConsumer {
         self.consumer.take().unwrap()
     }
 
-    #[allow(dead_code)]
     pub fn expect_event<F>(&self, f: F) -> Result<(), windows::core::Error>
     where
         F: FnOnce(EventRecord) -> bool + Send + Sync,
@@ -98,7 +96,7 @@ impl EtwEventWaiter {
             }
         }
 
-        return Ok::<(), windows::core::Error>(());
+        Ok::<(), windows::core::Error>(())
     }
 }
 
@@ -118,10 +116,11 @@ impl Iterator for EtwEventIter {
         }
 
         let evt = self.rx.next();
-        evt.and_then(|evt| {
+        evt.map(|evt| {
             let evt = evt.load(Ordering::Acquire);
             self.next = true;
-            Some(evt as *const EVENT_RECORD)
+
+            evt as *const EVENT_RECORD
         })
     }
 }
@@ -142,7 +141,7 @@ impl IntoIterator for EtwEventWaiter {
 #[cfg(test)]
 #[allow(non_upper_case_globals)]
 mod tests {
-    use crate::EtwSession;
+    use crate::{FileMode, SessionBuilder};
     use rsevents::Awaitable;
     use std::ffi::c_void;
     use tracelogging::{Guid, Level};
@@ -169,8 +168,7 @@ mod tests {
 
     #[test]
     fn consume_event() -> Result<(), windows::core::Error> {
-        const sz_test_name: windows::core::PCSTR =
-            windows::s!("EtwConsumer-Rust-Tests-ConsumeEvent-Crossbeam");
+        const test_name: &str = "EtwConsumer-Rust-Tests-ConsumeEvent-Crossbeam";
 
         let mut options = tracelogging_dynamic::Provider::options();
         let options = options.callback(
@@ -188,13 +186,20 @@ mod tests {
         let provider_guid = windows::core::GUID::from_u128(provider.id().to_u128());
         let mut eb = tracelogging_dynamic::EventBuilder::new();
 
-        let h = EtwSession::get_or_start_etw_session(sz_test_name, true)?;
+        let h = SessionBuilder::new_file_mode(
+            "EtwConsumer-Rust-Tests-ConsumeEvent-Crossbeam",
+            "cbce.etl",
+            FileMode::Sequential,
+        )
+        .realtime_event_delivery()
+        .start(true)?;
+
         h.enable_provider(&provider_guid)?;
 
-        let mut consumer = EtwEventWaiter::new();
+        let mut consumer = EtwEventWaiter::default();
         let event_consumer = consumer.get_consumer();
 
-        let trace = ProcessTraceHandle::from_session(sz_test_name, event_consumer)?;
+        let trace = ProcessTraceHandle::from_session(test_name, event_consumer)?;
 
         consume_event_enabled_event.wait();
 
@@ -240,8 +245,7 @@ mod tests {
 
     #[test]
     fn iterate() -> Result<(), windows::core::Error> {
-        const sz_test_name: windows::core::PCSTR =
-            windows::s!("EtwConsumer-Rust-Tests-Iterator-Crossbeam");
+        const test_name: &str = "EtwConsumer-Rust-Tests-Iterator-Crossbeam";
 
         let mut options = tracelogging_dynamic::Provider::options();
         let options = options.callback(
@@ -259,13 +263,20 @@ mod tests {
         let provider_guid = windows::core::GUID::from_u128(provider.id().to_u128());
         let mut eb = tracelogging_dynamic::EventBuilder::new();
 
-        let h = EtwSession::get_or_start_etw_session(sz_test_name, true)?;
+        let h = SessionBuilder::new_file_mode(
+            "EtwConsumer-Rust-Tests-Iterator-Crossbeam",
+            "cbi.etl",
+            FileMode::Sequential,
+        )
+        .realtime_event_delivery()
+        .start(true)?;
+
         h.enable_provider(&provider_guid)?;
 
-        let mut consumer = EtwEventWaiter::new();
+        let mut consumer = EtwEventWaiter::default();
         let event_consumer = consumer.get_consumer();
 
-        let trace = ProcessTraceHandle::from_session(sz_test_name, event_consumer)?;
+        let trace = ProcessTraceHandle::from_session(test_name, event_consumer)?;
 
         iterator_event_enabled_event.wait();
 

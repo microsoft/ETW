@@ -12,11 +12,15 @@ use std::{
 
 use rsevents::Awaitable;
 use windows::{
-    core::PCSTR,
+    core::PSTR,
     Win32::{Foundation::GetLastError, System::Diagnostics::Etw::*},
 };
 
-use crate::sessions::*;
+#[repr(C)]
+struct EventTraceLogFile {
+    props: EVENT_TRACE_LOGFILEA,
+    name: [u8; 1024],
+}
 
 struct ProcessTraceHandleWrapper(PROCESSTRACE_HANDLE);
 
@@ -58,9 +62,8 @@ where
     }
 
     fn process_trace_complete(&self, err: windows::core::Error) {
-        let res = <C as EventConsumer>::complete(&self.consumer, err);
+        <C as EventConsumer>::complete(&self.consumer, err);
         self.stopped.set();
-        res
     }
 
     fn close_trace(&self, block_on_thread_exit: bool) {
@@ -103,27 +106,54 @@ impl<C> ProcessTraceHandle<C>
 where
     C: EventConsumer + Send + Sync + 'static,
 {
-    #[allow(dead_code)]
-    pub fn from_session(
-        session_name: PCSTR,
-        consumer: C,
-    ) -> Result<ProcessTraceHandle<C>, windows::core::Error> {
+    pub fn from_session(session_name: &str, consumer: C) -> Result<Self, windows::core::Error> {
+        Self::create(session_name, false, consumer)
+    }
+
+    pub fn from_file(file_name: &str, consumer: C) -> Result<Self, windows::core::Error> {
+        Self::create(file_name, true, consumer)
+    }
+
+    fn create(name: &str, is_file: bool, consumer: C) -> Result<Self, windows::core::Error> {
         unsafe {
-            let mut log = EventTraceLogFile::from_session(
-                session_name,
-                Some(ProcessTraceHandle::<C>::event_record_callback),
-            );
             let inner = Arc::new(InnerProcessTraceHandle {
-                consumer: consumer,
+                consumer,
                 hndl: Mutex::new(None),
                 stop_callbacks: AtomicBool::new(false),
                 stopped: rsevents::ManualResetEvent::new(rsevents::EventState::Unset),
             });
 
             let clone = ManuallyDrop::new(inner.clone());
-            log = log.set_user_context(
-                &*clone.as_ref() as *const InnerProcessTraceHandle<C> as *const c_void
-            );
+
+            let mut log = {
+                if name.is_empty() {
+                    panic!()
+                }
+
+                let mut props: EventTraceLogFile = core::mem::zeroed();
+                props.props.Anonymous1.ProcessTraceMode =
+                    PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_REAL_TIME;
+                props.props.Anonymous2.EventRecordCallback = Some(Self::event_record_callback);
+
+                let len = name.len();
+                if len >= 1024 {
+                    panic!()
+                }
+
+                core::ptr::copy_nonoverlapping(name.as_ptr(), props.name.as_mut_ptr(), len);
+                props.name[len] = b'\0';
+
+                if is_file {
+                    props.props.LogFileName = PSTR::from_raw(props.name.as_mut_ptr());
+                } else {
+                    props.props.LoggerName = PSTR::from_raw(props.name.as_mut_ptr());
+                }
+
+                props.props.Context = clone.as_ref() as *const InnerProcessTraceHandle<C>
+                    as *const c_void as *mut c_void;
+
+                props
+            };
 
             let hndl = OpenTraceA(&mut log.props);
             if hndl.0 == u64::MAX {
@@ -136,25 +166,9 @@ where
         }
     }
 
-    // pub fn from_file(file_name: &str) -> Result<ProcessTraceHandle, windows::core::Error> {
-    //     unsafe {
-    //         let name = PCSTR::from_raw(file_name.as_ptr());
-    //         let mut log = EventTraceLogFile::from_file(name, Some(ProcessTraceHandle::event_record_callback));
-
-    //         let hndl = OpenTraceA(&mut log.props);
-    //         if hndl.0 == 0 {
-    //             let err = GetLastError();
-    //             Err(err.into())
-    //         } else {
-    //             Ok(ProcessTraceHandle{hndl: Box::pin(hndl)})
-    //         }
-    //     }
-    // }
-
-    #[allow(dead_code)]
     unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD) {
         let ctx = (*event_record).UserContext as *mut InnerProcessTraceHandle<C>;
-        if ctx != core::ptr::null_mut() {
+        if !ctx.is_null() {
             // It's not safe to let a panic cross back into C code.
             // Use AssertUnwindSafe because we will always abort in the event of a panic.
             let err = catch_unwind(AssertUnwindSafe(|| {
@@ -169,7 +183,6 @@ where
         }
     }
 
-    #[allow(dead_code)]
     pub fn process_trace(self) -> Result<ProcessTraceThread<C>, windows::core::Error> {
         let thread = spawn_process_trace_thread(self.inner.clone(), self.ctx);
 
@@ -214,13 +227,11 @@ impl<C> ProcessTraceThread<C>
 where
     C: EventConsumer + Send + Sync,
 {
-    #[allow(dead_code)]
     pub fn stop_and_wait(&mut self) -> Result<(), windows::core::Error> {
         let thread = self.stop_and_get_thread();
         thread.join().unwrap()
     }
 
-    #[allow(dead_code)]
     pub fn stop_and_get_thread(&mut self) -> JoinHandle<Result<(), windows::core::Error>> {
         self.inner.close_trace(false);
         self.thread.take().unwrap()
