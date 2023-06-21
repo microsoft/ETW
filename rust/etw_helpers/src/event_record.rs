@@ -1,6 +1,8 @@
 //use core::mem::size_of;
-use std::borrow::{Cow};
-use windows::Win32::System::Diagnostics::Etw::{ETW_BUFFER_CONTEXT, EVENT_HEADER, EVENT_RECORD, EVENT_HEADER_EXTENDED_DATA_ITEM};
+use std::borrow::Cow;
+use windows::Win32::System::Diagnostics::Etw::{
+    ETW_BUFFER_CONTEXT, EVENT_HEADER, EVENT_HEADER_EXTENDED_DATA_ITEM, EVENT_RECORD,
+};
 
 pub enum EventRecord {
     Owned(EventRecordOwned),
@@ -41,24 +43,20 @@ impl EventRecord {
     pub fn get_event_header(&self) -> Cow<EVENT_HEADER> {
         match self {
             EventRecord::Owned(evt) => Cow::Borrowed(&evt.event_header),
-            EventRecord::Raw(evt) => unsafe {
-                Cow::Borrowed(&(**evt).EventHeader)
-            }
+            EventRecord::Raw(evt) => unsafe { Cow::Borrowed(&(**evt).EventHeader) },
             EventRecord::Serialized(_evt) => {
                 todo!()
-            },
+            }
         }
     }
 
     pub fn get_buffer_context(&self) -> Cow<ETW_BUFFER_CONTEXT> {
         match self {
             EventRecord::Owned(evt) => Cow::Borrowed(&evt.buffer_context),
-            EventRecord::Raw(evt) => unsafe {
-                Cow::Borrowed(&(**evt).BufferContext)
-            }
+            EventRecord::Raw(evt) => unsafe { Cow::Borrowed(&(**evt).BufferContext) },
             EventRecord::Serialized(_evt) => {
                 todo!()
-            },
+            }
         }
     }
 
@@ -66,11 +64,14 @@ impl EventRecord {
         match self {
             EventRecord::Owned(evt) => evt.user_data.as_slice(),
             EventRecord::Raw(evt) => unsafe {
-                core::slice::from_raw_parts((**evt).UserData as *const u8, (**evt).UserDataLength as usize)
-            }
+                core::slice::from_raw_parts(
+                    (**evt).UserData as *const u8,
+                    (**evt).UserDataLength as usize,
+                )
+            },
             EventRecord::Serialized(_evt) => {
                 todo!()
-            },
+            }
         }
     }
 
@@ -132,17 +133,24 @@ impl ToOwned for EventRecord {
                     let mut owned_exdi: Vec<ExtendedDataItemOwned> =
                         Vec::with_capacity((*evt).ExtendedDataCount as usize);
 
-                    let raw_exdi = core::slice::from_raw_parts((*evt).ExtendedData, (*evt).ExtendedDataCount as usize);
+                    let raw_exdi = core::slice::from_raw_parts(
+                        (*evt).ExtendedData,
+                        (*evt).ExtendedDataCount as usize,
+                    );
 
                     for exdi in raw_exdi {
                         let mut data: Vec<u8> = Vec::with_capacity(exdi.DataSize as usize);
-                        core::ptr::copy_nonoverlapping(exdi.DataPtr as *const u8, data.as_mut_ptr(), exdi.DataSize as usize);
+                        core::ptr::copy_nonoverlapping(
+                            exdi.DataPtr as *const u8,
+                            data.as_mut_ptr(),
+                            exdi.DataSize as usize,
+                        );
                         data.set_len(exdi.DataSize as usize);
 
                         owned_exdi.push(ExtendedDataItemOwned {
                             ext_type: exdi.ExtType,
                             flags: exdi.Anonymous._bitfield,
-                            data: data,
+                            data,
                         });
                     }
 
@@ -158,7 +166,7 @@ impl ToOwned for EventRecord {
                         event_header: (*evt).EventHeader,
                         buffer_context: (*evt).BufferContext,
                         extended_data_items: vec![],
-                        user_data: user_data,
+                        user_data,
                     };
 
                     // Ensure flags are set properly
@@ -204,25 +212,30 @@ impl<'a> Iterator for ExtendedDataItemIterator<'a> {
                     flags: evt.extended_data_items[self.index].flags,
                     data: evt.extended_data_items[self.index].data.as_slice(),
                 });
-            },
+            }
             EventRecord::Raw(evt) => unsafe {
                 if self.index >= (**evt).ExtendedDataCount as usize {
                     return None;
                 }
 
-                let items = core::slice::from_raw_parts((**evt).ExtendedData as *const EVENT_HEADER_EXTENDED_DATA_ITEM, (**evt).ExtendedDataCount as usize);
+                let items = core::slice::from_raw_parts(
+                    (**evt).ExtendedData as *const EVENT_HEADER_EXTENDED_DATA_ITEM,
+                    (**evt).ExtendedDataCount as usize,
+                );
                 let exdi = &items[self.index];
-                let exdi_data = core::slice::from_raw_parts(exdi.DataPtr as *const u8, exdi.DataSize as usize);
-                return Some(ExtendedDataItem {
+                let exdi_data =
+                    core::slice::from_raw_parts(exdi.DataPtr as *const u8, exdi.DataSize as usize);
+
+                Some(ExtendedDataItem {
                     ext_type: items[self.index].ExtType,
                     flags: items[self.index].Anonymous._bitfield,
                     data: exdi_data,
-                });
-            }
+                })
+            },
             EventRecord::Serialized(_evt) => {
                 todo!()
-            },
-        };
+            }
+        }
     }
 }
 
