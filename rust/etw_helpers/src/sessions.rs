@@ -324,13 +324,14 @@ impl ControlTraceHandle {
     pub fn enable_provider(
         &self,
         provider_id: &windows::core::GUID,
+        level: u8,
     ) -> Result<(), windows::core::Error> {
         unsafe {
             let err = EnableTraceEx2(
                 self.0,
                 provider_id,
                 EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
-                0xFF,
+                level,
                 0,
                 0,
                 0,

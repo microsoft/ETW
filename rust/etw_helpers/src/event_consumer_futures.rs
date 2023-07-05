@@ -140,7 +140,7 @@ mod tests {
         .realtime_event_delivery()
         .start(true)?;
 
-        h.enable_provider(&provider_guid)?;
+        h.enable_provider(&provider_guid, 0xFF)?;
 
         let mut consumer = EtwEventAsyncWaiter::default();
         let event_consumer = consumer.get_consumer();
