@@ -141,7 +141,7 @@ mod tests {
         .realtime_event_delivery()
         .start(true)?;
 
-        h.enable_provider(&provider_guid)?;
+        h.enable_provider(&provider_guid, 0xFF)?;
 
         let etw_event_stream = EtwEventAsyncStream::default();
         let event_consumer = etw_event_stream.get_consumer();
