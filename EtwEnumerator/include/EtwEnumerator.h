@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 /*
 Defines the EtwEnumerator class.
 EtwEnumerator helps decode and format ETW events.

@@ -10,7 +10,8 @@ C++ library for decoding and formatting ETW events.
   order the field appears in the event's payload.
 - Provides helper methods to format individual field values as strings.
 - Provides helper methods to format the entire event as a string, either using
-  the event's message string (if it has one) or using JSON.
+  the event's message string (if it has one) or using JSON. Uses formatting
+  rules similar to the Windows SDK `tracefmt` tool.
 - Supports structured data, i.e. arrays and nested structures.
 - Exposes the information from
   [TRACE_EVENT_INFO](https://learn.microsoft.com/windows/win32/api/tdh/ns-tdh-trace_event_info)
