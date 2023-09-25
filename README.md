@@ -2,6 +2,8 @@
 
 This project contains various tools and samples for using ETW (Event Tracing for Windows). They can be used as a reference for solving similar problems in your own code, or used wholesale by your project. Please refer to the README files in each subdirectory for more details on what the code there does and how to use it.
 
+- [EtwEnumerator](EtwEnumerator) - C++ class for decoding and formatting ETW events.
+
 ## Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
