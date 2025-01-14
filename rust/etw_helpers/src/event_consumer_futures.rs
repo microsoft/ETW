@@ -71,8 +71,10 @@ impl EtwEventAsyncWaiter {
     {
         // A ref to rx is only held in this single function
         #[allow(clippy::await_holding_refcell_ref)]
-        let next_event = self.rx.borrow_mut().next().await;
-        let next_event_record = EventRecord::new(next_event.unwrap().load(Ordering::Acquire));
+        let next = self.rx.borrow_mut().next().await;
+        let evt_ptr: *const EVENT_RECORD = next.unwrap().load(Ordering::Acquire);
+        let evt: &EVENT_RECORD = unsafe { &*evt_ptr };
+        let next_event_record: EventRecord = EventRecord::from_ref(evt);
 
         let should_continue = f(next_event_record);
         if !should_continue {

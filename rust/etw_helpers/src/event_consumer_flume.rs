@@ -77,7 +77,9 @@ impl EtwEventWaiter {
     {
         let _ = Selector::new()
             .recv(&self.rx, |ptr| {
-                let next_event_record = EventRecord::new(ptr.unwrap().load(Ordering::Acquire));
+                let evt_ptr: *const EVENT_RECORD = ptr.unwrap().load(Ordering::Acquire);
+                let evt: &EVENT_RECORD = unsafe { &*evt_ptr };
+                let next_event_record: EventRecord = EventRecord::from_ref(evt);
 
                 let should_continue = f(next_event_record);
                 let hr = if !should_continue { E_CANCELLED } else { S_OK };

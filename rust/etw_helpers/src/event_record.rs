@@ -4,9 +4,9 @@ use windows::Win32::System::Diagnostics::Etw::{
     ETW_BUFFER_CONTEXT, EVENT_HEADER, EVENT_HEADER_EXTENDED_DATA_ITEM, EVENT_RECORD,
 };
 
-pub enum EventRecord {
+pub enum EventRecord<'a> {
     Owned(EventRecordOwned),
-    Raw(*const EVENT_RECORD),
+    Raw(&'a EVENT_RECORD),
     Serialized(Vec<u8>), // EventRecordSerialized as little endian bytes
 }
 
@@ -34,16 +34,25 @@ pub struct EventRecordOwned {
 //     // data: [u8; Size - sizeof(self)]
 // }
 
-impl EventRecord {
-    pub fn new(evt: *const EVENT_RECORD) -> Self {
+impl<'a> EventRecord<'a> {
+    pub fn from_ref(evt: &'a EVENT_RECORD) -> Self {
         // TODO: Check pointers and lengths
         EventRecord::Raw(evt)
+    }
+
+    pub unsafe fn from_ptr(evt: *const EVENT_RECORD) -> Result<Self, windows::core::Error> {
+        if evt.is_null() || !evt.is_aligned() {
+            Err(crate::error::E_UNEXPECTED.into()) //TODO
+        }
+        else {
+            Ok(EventRecord::<'static>::Raw(&*evt))
+        }
     }
 
     pub fn get_event_header(&self) -> Cow<EVENT_HEADER> {
         match self {
             EventRecord::Owned(evt) => Cow::Borrowed(&evt.event_header),
-            EventRecord::Raw(evt) => unsafe { Cow::Borrowed(&(**evt).EventHeader) },
+            EventRecord::Raw(evt) => Cow::Borrowed(&evt.EventHeader),
             EventRecord::Serialized(_evt) => {
                 todo!()
             }
@@ -53,7 +62,7 @@ impl EventRecord {
     pub fn get_buffer_context(&self) -> Cow<ETW_BUFFER_CONTEXT> {
         match self {
             EventRecord::Owned(evt) => Cow::Borrowed(&evt.buffer_context),
-            EventRecord::Raw(evt) => unsafe { Cow::Borrowed(&(**evt).BufferContext) },
+            EventRecord::Raw(evt) => Cow::Borrowed(&evt.BufferContext),
             EventRecord::Serialized(_evt) => {
                 todo!()
             }
@@ -65,8 +74,8 @@ impl EventRecord {
             EventRecord::Owned(evt) => evt.user_data.as_slice(),
             EventRecord::Raw(evt) => unsafe {
                 core::slice::from_raw_parts(
-                    (**evt).UserData as *const u8,
-                    (**evt).UserDataLength as usize,
+                    evt.UserData as *const u8,
+                    evt.UserDataLength as usize,
                 )
             },
             EventRecord::Serialized(_evt) => {
@@ -111,10 +120,10 @@ impl EventRecord {
 //     }
 // }
 
-impl ToOwned for EventRecord {
-    type Owned = EventRecord;
+impl<'a> ToOwned for EventRecord<'a> {
+    type Owned = EventRecord<'a>;
 
-    fn to_owned(&self) -> <EventRecord as ToOwned>::Owned {
+    fn to_owned(&self) -> <EventRecord<'a> as ToOwned>::Owned {
         match self {
             EventRecord::Owned(evt) => EventRecord::Owned(evt.clone()),
             EventRecord::Raw(evt) => {
@@ -129,7 +138,6 @@ impl ToOwned for EventRecord {
                     pub UserContext: *mut ::core::ffi::c_void,
                 } */
                 unsafe {
-                    let evt = *evt;
                     let mut owned_exdi: Vec<ExtendedDataItemOwned> =
                         Vec::with_capacity((*evt).ExtendedDataCount as usize);
 
@@ -186,8 +194,8 @@ impl ToOwned for EventRecord {
     }
 }
 
-pub struct ExtendedDataItemIterator<'a> {
-    evt: &'a EventRecord,
+pub struct ExtendedDataItemIterator<'a, 'evt> {
+    evt: &'a EventRecord<'evt>,
     index: usize,
 }
 
@@ -197,7 +205,7 @@ pub struct ExtendedDataItem<'a> {
     pub data: &'a [u8],
 }
 
-impl<'a> Iterator for ExtendedDataItemIterator<'a> {
+impl<'a, 'evt> Iterator for ExtendedDataItemIterator<'a, 'evt> {
     type Item = ExtendedDataItem<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {

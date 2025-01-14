@@ -1,10 +1,8 @@
 use std::{
-    marker::PhantomData,
-    pin::Pin,
-    sync::{
+    marker::PhantomData, pin::Pin, sync::{
         atomic::{AtomicPtr, Ordering},
         Arc, Condvar, Mutex,
-    },
+    }
 };
 
 use futures::{task, Stream};
@@ -14,14 +12,13 @@ use crate::error::*;
 use crate::event_record::EventRecord;
 use crate::processtrace::*;
 
-struct EtwEventStreamInner<'a> {
+struct EtwEventStreamInner {
     waker: Mutex<Option<task::Waker>>,
     next_event: Mutex<AtomicPtr<EVENT_RECORD>>,
     consumer_complete: Arc<Condvar>,
-    _x: PhantomData<&'a bool>,
 }
 
-impl<'a> EventConsumer for EtwEventStreamConsumer<'a> {
+impl EventConsumer for EtwEventStreamConsumer{
     unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), windows::core::Error> {
         let mut guard = self.inner.next_event.lock().unwrap();
         if !guard.load(Ordering::Acquire).is_null() {
@@ -48,8 +45,8 @@ impl<'a> EventConsumer for EtwEventStreamConsumer<'a> {
     }
 }
 
-impl<'a> Stream for EtwEventStreamExt<'a> {
-    type Item = EventRecord;
+impl<'evt> Stream for EtwEventAsyncStream<'evt> {
+    type Item = EventRecord<'evt>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -57,55 +54,46 @@ impl<'a> Stream for EtwEventStreamExt<'a> {
     ) -> task::Poll<Option<Self::Item>> {
         *self.inner.waker.lock().unwrap() = Some(cx.waker().clone());
         let guard = self.inner.next_event.lock().unwrap();
-        let ptr = guard.load(Ordering::Acquire);
-        if ptr.is_null() {
+        let evt_ptr = guard.load(Ordering::Acquire);
+        if evt_ptr.is_null() {
             task::Poll::Pending
-        } else if ptr == (12345 as *mut EVENT_RECORD) {
+        } else if evt_ptr == (12345 as *mut EVENT_RECORD) {
             task::Poll::Ready(None)
         } else {
-            let evt = guard.load(Ordering::Acquire);
             guard.store(core::ptr::null_mut(), Ordering::Release);
-            let result = task::Poll::Ready(Some(EventRecord::new(evt)));
+            let evt = unsafe { &*evt_ptr };
+            let result = task::Poll::Ready(Some(EventRecord::from_ref(evt)));
             self.inner.consumer_complete.notify_all();
             result
         }
     }
 }
 
-pub struct EtwEventStreamConsumer<'a> {
-    inner: Arc<EtwEventStreamInner<'a>>,
+pub struct EtwEventStreamConsumer {
+    inner: Arc<EtwEventStreamInner>,
 }
 
-pub struct EtwEventStreamExt<'a> {
-    inner: Arc<EtwEventStreamInner<'a>>,
+pub struct EtwEventAsyncStream<'evt> {
+    inner: Arc<EtwEventStreamInner>,
+    _p: PhantomData<&'evt bool>
 }
 
-pub struct EtwEventAsyncStream<'a> {
-    inner: Arc<EtwEventStreamInner<'a>>,
-}
-
-impl<'a> Default for EtwEventAsyncStream<'a> {
+impl Default for EtwEventAsyncStream<'_> {
     fn default() -> Self {
         EtwEventAsyncStream {
             inner: Arc::new(EtwEventStreamInner {
                 waker: Mutex::new(None),
                 next_event: Mutex::new(AtomicPtr::new(core::ptr::null_mut())),
                 consumer_complete: Arc::default(),
-                _x: PhantomData,
             }),
+            _p: PhantomData,
         }
     }
 }
 
-impl<'a> EtwEventAsyncStream<'a> {
-    pub fn get_consumer(&self) -> impl EventConsumer + 'a {
+impl EtwEventAsyncStream<'_> {
+    pub fn get_consumer(&self) -> impl EventConsumer {
         EtwEventStreamConsumer {
-            inner: self.inner.clone(),
-        }
-    }
-
-    pub fn get_stream(&self) -> impl Stream + 'a {
-        EtwEventStreamExt {
             inner: self.inner.clone(),
         }
     }
@@ -145,13 +133,12 @@ mod tests {
 
         let etw_event_stream = EtwEventAsyncStream::default();
         let event_consumer = etw_event_stream.get_consumer();
-        let event_stream = etw_event_stream.get_stream();
 
         let trace = ProcessTraceHandle::from_session(test_name, event_consumer)?;
 
         let mut thread = trace.process_trace()?;
 
-        let mut events = event_stream.enumerate().fuse();
+        let mut events = etw_event_stream.enumerate().fuse();
 
         eb.write(&provider, None, None);
         eb.write(&provider, None, None);
