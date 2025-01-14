@@ -170,6 +170,9 @@ mod tests {
     fn consume_event() -> Result<(), windows::core::Error> {
         const test_name: &str = "EtwConsumer-Rust-Tests-ConsumeEvent-Crossbeam";
 
+        let test_dir = std::path::PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap_or(".\\target".to_string()));
+        let file_path = test_dir.join("cbce.etl");
+
         let mut options = tracelogging_dynamic::Provider::options();
         let options = options.callback(
             provider_enabled_callback,
@@ -188,7 +191,7 @@ mod tests {
 
         let h = SessionBuilder::new_file_mode(
             "EtwConsumer-Rust-Tests-ConsumeEvent-Crossbeam",
-            "cbce.etl",
+            &file_path.to_string_lossy(),
             FileMode::Sequential,
         )
         .realtime_event_delivery()

@@ -168,7 +168,7 @@ mod tests {
             }
         }
 
-        let _ = process_trace_thread.expect("x").join(); // We don't care about what ProcessTrace returned
+        let _ = process_trace_thread.expect("x")?.join(); // We don't care about what ProcessTrace returned
 
         Ok(())
     }

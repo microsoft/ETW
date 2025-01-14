@@ -102,9 +102,9 @@ impl EtwSession {
             if err.is_err() {
                 Err(err.into())
             } else {
-                Ok(ControlTraceHandle(CONTROLTRACE_HANDLE(
-                    properties.props.Wnode.Anonymous1.HistoricalContext,
-                )))
+                Ok(ControlTraceHandle(CONTROLTRACE_HANDLE {
+                    Value: properties.props.Wnode.Anonymous1.HistoricalContext,
+            }))
             }
         }
     }
