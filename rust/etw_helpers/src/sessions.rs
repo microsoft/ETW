@@ -1,12 +1,12 @@
 use std::{borrow::Cow, mem::ManuallyDrop};
 
-use windows::{core::PCSTR, Win32::System::Diagnostics::Etw::*};
+use windows::{core::PCWSTR, Win32::System::Diagnostics::Etw::*};
 
 #[repr(C)]
 pub struct EventTraceProperties {
     props: EVENT_TRACE_PROPERTIES,
-    session_name: [u8; 1024],
-    file_name: [u8; 1024],
+    session_name: [u16; 1024],
+    file_name: [u16; 1024],
 }
 
 impl EventTraceProperties {
@@ -26,23 +26,21 @@ impl EventTraceProperties {
 
     pub fn set_session_name(&mut self, session_name: &str) -> &mut Self {
         if !session_name.is_empty() {
-            unsafe {
-                let len = session_name.len();
-                if len >= 1024 {
-                    panic!()
+            let name_utf16 = session_name.encode_utf16();
+
+            let mut i = 0;
+            for c in name_utf16 {
+                self.session_name[i] = c;
+                i += 1;
+
+                if i >= 1024 {
+                    panic!();
                 }
-
-                // TODO: Can we actually use UTF-8 as a session name?
-                core::ptr::copy_nonoverlapping(
-                    session_name.as_ptr(),
-                    self.session_name.as_mut_ptr(),
-                    len,
-                );
-
-                self.session_name[len] = b'\0';
-
-                self.props.LoggerNameOffset = core::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
             }
+
+            self.session_name[i] = 0; // nul-terminate
+
+            self.props.LoggerNameOffset = core::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
         }
 
         self
@@ -50,23 +48,21 @@ impl EventTraceProperties {
 
     pub fn set_file_name(&mut self, file_name: &str) -> &mut Self {
         if !file_name.is_empty() {
-            unsafe {
-                let len = file_name.len();
-                if len >= 1024 {
-                    panic!()
+            let name_utf16 = file_name.encode_utf16();
+
+            let mut i = 0;
+            for c in name_utf16 {
+                self.file_name[i] = c;
+                i += 1;
+
+                if i >= 1024 {
+                    panic!();
                 }
-
-                core::ptr::copy_nonoverlapping(
-                    file_name.as_ptr(),
-                    self.file_name.as_mut_ptr(),
-                    len,
-                );
-
-                self.file_name[len] = b'\0';
-
-                self.props.LogFileNameOffset =
-                    core::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32 + 1024;
             }
+
+            self.file_name[i] = 0; // nul-terminate
+
+            self.props.LogFileNameOffset = core::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32 + 1024;
         }
 
         self
@@ -80,7 +76,7 @@ impl Drop for ControlTraceHandle {
         let mut props = EventTraceProperties::empty_for_query();
         unsafe {
             let ptr = &mut props.props as *mut EVENT_TRACE_PROPERTIES;
-            let _ = StopTraceA(self.0, PCSTR::null(), ptr);
+            let _ = StopTraceW(self.0, PCWSTR::null(), ptr);
         }
     }
 }
@@ -89,13 +85,13 @@ pub struct EtwSession(core::marker::PhantomData<&'static bool>);
 
 impl EtwSession {
     pub fn get_etw_session(
-        sz_session_name: PCSTR,
+        wsz_session_name: PCWSTR,
     ) -> Result<ControlTraceHandle, windows::core::Error> {
         unsafe {
             let mut properties = EventTraceProperties::empty_for_query();
-            let err = ControlTraceA(
+            let err = ControlTraceW(
                 CONTROLTRACE_HANDLE::default(),
-                sz_session_name,
+                wsz_session_name,
                 &mut properties.props,
                 EVENT_TRACE_CONTROL_QUERY,
             );
@@ -286,7 +282,7 @@ where
         unsafe {
             if recreate_existing_session {
                 let existing_session =
-                    EtwSession::get_etw_session(PCSTR(properties.session_name.as_ptr()));
+                    EtwSession::get_etw_session(PCWSTR(properties.session_name.as_ptr()));
                 if existing_session.is_ok() {
                     // Stop existing session
                     drop(existing_session);
@@ -301,9 +297,9 @@ where
             }
 
             let ptr = &mut properties.props as *mut EVENT_TRACE_PROPERTIES;
-            let err = StartTraceA(
+            let err = StartTraceW(
                 &mut session_handle,
-                PCSTR(properties.session_name.as_ptr()),
+                PCWSTR(properties.session_name.as_ptr()),
                 ptr,
             );
 

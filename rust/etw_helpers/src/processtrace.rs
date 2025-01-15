@@ -4,14 +4,14 @@ use std::{
 
 use rsevents::Awaitable;
 use windows::{
-    core::PSTR,
+    core::PWSTR,
     Win32::{Foundation::GetLastError, System::Diagnostics::Etw::*},
 };
 
 #[repr(C)]
 struct EventTraceLogFile {
-    props: EVENT_TRACE_LOGFILEA,
-    name: [u8; 1024],
+    props: EVENT_TRACE_LOGFILEW,
+    name: [u16; 1024],
 }
 
 struct SharedThreadData {
@@ -117,18 +117,24 @@ where
                     PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_REAL_TIME;
                 props.props.Anonymous2.EventRecordCallback = Some(Self::event_record_callback);
 
-                let len = name.len();
-                if len >= 1024 {
-                    panic!()
+                let name_utf16 = name.encode_utf16();
+
+                let mut i = 0;
+                for c in name_utf16 {
+                    props.name[i] = c;
+                    i += 1;
+
+                    if i >= 1024 {
+                        panic!();
+                    }
                 }
 
-                core::ptr::copy_nonoverlapping(name.as_ptr(), props.name.as_mut_ptr(), len);
-                props.name[len] = b'\0';
+                props.name[i] = 0; // nul-terminate
 
                 if is_file {
-                    props.props.LogFileName = PSTR::from_raw(props.name.as_mut_ptr());
+                    props.props.LogFileName = PWSTR::from_raw(props.name.as_mut_ptr());
                 } else {
-                    props.props.LoggerName = PSTR::from_raw(props.name.as_mut_ptr());
+                    props.props.LoggerName = PWSTR::from_raw(props.name.as_mut_ptr());
                 }
 
                 // Cast through usize so tools can (potentially, in the future) track and understand
@@ -142,7 +148,7 @@ where
                 props
             };
 
-            let hndl = OpenTraceA(&mut log.props);
+            let hndl = OpenTraceW(&mut log.props);
             if hndl.Value == u64::MAX {
                 let err = GetLastError();
                 Err(err.into())
