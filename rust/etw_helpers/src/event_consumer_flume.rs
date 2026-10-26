@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::time::Duration;
 
 use flume::select::Selector;
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
@@ -40,11 +41,28 @@ impl EventConsumer for FlumeChannelConsumer {
     }
 }
 
+/// Synchronously receives ETW events from a [`ProcessTraceHandle`] thread.
+///
+/// Events borrow the waiter mutably, and the ETW callback thread stays blocked until
+/// that borrow ends. Holding an event across the next call to `next()` is a compile error:
+///
+/// ```compile_fail
+/// # fn f(waiter: &mut etw_helpers::event_consumer_flume::EtwEventWaiter) {
+/// let first = waiter.next();
+/// let second = waiter.next(); // error[E0499]: cannot borrow `*waiter` as mutable more than once
+/// drop(first);
+/// # }
+/// ```
+///
+/// The ETW thread cannot exit while an event is lent, so drain the waiter or drop it
+/// before joining the [`ProcessTraceThread`].
 pub struct EtwEventWaiter {
     rx: flume::Receiver<AtomicPtr<EVENT_RECORD>>,
     callback_tx: flume::Sender<windows::core::HRESULT>,
     session_closed_rx: flume::Receiver<windows::core::HRESULT>,
     consumer: Option<FlumeChannelConsumer>,
+    // True while the ETW callback is blocked waiting for us to release an event returned by `next()`
+    lent: bool,
 }
 
 impl Default for EtwEventWaiter {
@@ -62,22 +80,85 @@ impl Default for EtwEventWaiter {
                 callback_rx,
                 session_closed_tx,
             }),
+            lent: false,
         }
     }
 }
 
 impl EtwEventWaiter {
-    pub fn get_consumer(&mut self) -> impl EventConsumer {
+    /// Returns the [`EventConsumer`] to pass to [`ProcessTraceHandle`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once.
+    pub fn get_consumer(&mut self) -> impl EventConsumer + use<> {
         self.consumer.take().unwrap()
     }
 
-    pub fn expect_event<F>(&self, mut f: F) -> Result<(), windows::core::Error>
+    /// Blocks until the next event arrives. Returns `None` once ProcessTrace has completed.
+    ///
+    /// The returned event borrows `self`, so it must be dropped before calling `next()` again.
+    // Can't be `Iterator::next`: iterator items can't borrow from the iterator.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<EventRecord<'_>> {
+        // Requiring `&mut self` guarantees any previously returned event is no longer referenced.
+        self.release_current().ok()?;
+
+        let ptr = Selector::new()
+            .recv(&self.rx, |ptr| ptr.ok())
+            .recv(&self.session_closed_rx, |_| None)
+            .wait()?;
+        self.lent = true;
+
+        // SAFETY: the ETW callback that owns this event is blocked until we send on
+        // `callback_tx`, which only happens in `release_current` (requires `&mut self`,
+        // ending this borrow) or when `self` is dropped.
+        Some(EventRecord::from_ref(unsafe { &*ptr.load(Ordering::Acquire) }))
+    }
+
+    fn release_current(&mut self) -> Result<(), windows::core::Error> {
+        if self.lent {
+            self.lent = false;
+            if self.callback_tx.send(S_OK).is_err() {
+                return Err(E_UNEXPECTED.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for the next event and passes it to `f`. Returning `false` from `f` stops the trace.
+    ///
+    /// Returns an error once ProcessTrace has completed.
+    pub fn expect_event<F>(&mut self, f: F) -> Result<(), windows::core::Error>
     where
         F: FnMut(EventRecord) -> bool + Send + Sync,
     {
-        let _ = Selector::new()
+        self.expect_event_inner(None, f)
+    }
+
+    /// Like [`expect_event`](Self::expect_event), but gives up if no event arrives within `timeout`.
+    ///
+    /// On timeout, returns an error with code `HRESULT_FROM_WIN32(ERROR_TIMEOUT)`
+    /// (`windows::Win32::Foundation::ERROR_TIMEOUT.to_hresult()`), and `f` is not called.
+    pub fn expect_event_timeout<F>(&mut self, timeout: Duration, f: F) -> Result<(), windows::core::Error>
+    where
+        F: FnMut(EventRecord) -> bool + Send + Sync,
+    {
+        self.expect_event_inner(Some(timeout), f)
+    }
+
+    fn expect_event_inner<F>(&mut self, timeout: Option<Duration>, mut f: F) -> Result<(), windows::core::Error>
+    where
+        F: FnMut(EventRecord) -> bool + Send + Sync,
+    {
+        self.release_current()?;
+
+        let selector = Selector::new()
             .recv(&self.rx, |ptr| {
-                let evt_ptr: *const EVENT_RECORD = ptr.unwrap().load(Ordering::Acquire);
+                let Ok(ptr) = ptr else {
+                    return Err(self.closed_error());
+                };
+                let evt_ptr: *const EVENT_RECORD = ptr.load(Ordering::Acquire);
                 let evt: &EVENT_RECORD = unsafe { &*evt_ptr };
                 let next_event_record: EventRecord = EventRecord::from_ref(evt);
 
@@ -92,49 +173,20 @@ impl EtwEventWaiter {
                 }
             })
             .recv(&self.session_closed_rx, |hr| {
-                Result::<(), windows::core::Error>::Err(hr.unwrap().into())
-            })
-            .wait();
+                Err(hr.unwrap_or(E_UNEXPECTED).into())
+            });
 
-        Ok::<(), windows::core::Error>(())
-    }
-}
-
-pub struct EtwEventIter {
-    rx: flume::IntoIter<AtomicPtr<EVENT_RECORD>>,
-    callback_tx: flume::Sender<windows::core::HRESULT>,
-    next: bool,
-}
-
-impl Iterator for EtwEventIter {
-    type Item = *const EVENT_RECORD;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next {
-            let _ = self.callback_tx.send(S_OK);
-            self.next = false;
+        match timeout {
+            None => selector.wait(),
+            Some(timeout) => selector
+                .wait_timeout(timeout)
+                .unwrap_or_else(|_| Err(E_TIMEOUT.into())),
         }
-
-        let evt = self.rx.next();
-        evt.map(|evt| {
-            let evt = evt.load(Ordering::Acquire);
-            self.next = true;
-
-            evt as *const EVENT_RECORD
-        })
     }
-}
 
-impl IntoIterator for EtwEventWaiter {
-    type IntoIter = EtwEventIter;
-    type Item = *const EVENT_RECORD;
-
-    fn into_iter(self) -> Self::IntoIter {
-        EtwEventIter {
-            rx: self.rx.into_iter(),
-            callback_tx: self.callback_tx,
-            next: false,
-        }
+    // The ETW thread has exited; report how ProcessTrace completed if we haven't already.
+    fn closed_error(&self) -> windows::core::Error {
+        self.session_closed_rx.try_recv().unwrap_or(E_UNEXPECTED).into()
     }
 }
 
@@ -163,6 +215,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn expect_event_timeout() {
+        // The consumer is never given to ProcessTrace, so the channels stay open but no event arrives.
+        let mut waiter = EtwEventWaiter::default();
+        let start = std::time::Instant::now();
+        let err = waiter
+            .expect_event_timeout(Duration::from_millis(50), |_| panic!("no event expected"))
+            .unwrap_err();
+        assert_eq!(err.code(), windows::Win32::Foundation::ERROR_TIMEOUT.to_hresult());
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
     static consume_event_enabled_event: rsevents::ManualResetEvent =
         rsevents::ManualResetEvent::new(rsevents::EventState::Unset);
 
@@ -178,7 +242,7 @@ mod tests {
 
         let provider = Box::pin(tracelogging_dynamic::Provider::new(
             "flume_consume_event_test",
-            &options,
+            options,
         ));
         unsafe {
             provider.as_ref().register();
@@ -216,7 +280,7 @@ mod tests {
         let mut thread = trace.process_trace()?;
 
         assert!(consumer
-            .expect_event(|evt| {
+            .expect_event_timeout(Duration::from_secs(10), |evt| {
                 let event_header = evt.get_event_header();
                 assert_eq!(event_header.ProviderId, provider_guid);
                 assert_eq!(event_header.EventDescriptor.Keyword, 1u64);
@@ -234,6 +298,9 @@ mod tests {
                 false
             })
             .is_ok());
+
+        // The closure above returned false, which cancels the trace.
+        assert!(consumer.expect_event(|_| true).is_err());
 
         let _ = thread.stop_and_wait(); // We don't care about what ProcessTrace returned
 
@@ -255,7 +322,7 @@ mod tests {
 
         let provider = Box::pin(tracelogging_dynamic::Provider::new(
             "iterate_event_test",
-            &options,
+            options,
         ));
         unsafe {
             provider.as_ref().register();
@@ -292,14 +359,18 @@ mod tests {
         let mut thread = trace.process_trace()?;
 
         let mut count = 0;
-        for _evt in consumer {
+        while let Some(evt) = consumer.next() {
+            assert_eq!(evt.get_event_header().ProviderId, provider_guid);
             count += 1;
 
             if count == 5 {
                 break;
             }
         }
+        assert_eq!(count, 5);
 
+        // Release the last event so ProcessTrace can return
+        drop(consumer);
         let _ = thread.stop_and_wait(); // We don't care about what ProcessTrace returned
 
         Ok(())

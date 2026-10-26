@@ -1,10 +1,10 @@
-#[cfg(any(feature = "crossbeam"))]
+#[cfg(feature = "crossbeam")]
 pub mod event_consumer_crossbeam;
-#[cfg(any(feature = "flume"))]
+#[cfg(feature = "flume")]
 pub mod event_consumer_flume;
-#[cfg(any(feature = "futures"))]
+#[cfg(feature = "futures")]
 mod event_consumer_futures;
-#[cfg(any(feature = "futures"))]
+#[cfg(feature = "futures")]
 mod event_consumer_futures_stream;
 //mod event_consumer_raw;
 mod error;
@@ -28,7 +28,7 @@ pub mod event_consumer {
 }
 
 /// When the `futures` feature is enabled, this module will contain the async event consumers.
-#[cfg(any(feature = "futures"))]
+#[cfg(feature = "futures")]
 pub mod event_consumer_async {
     pub use super::event_consumer_futures::*;
     pub use super::event_consumer_futures_stream::*;

@@ -1,101 +1,187 @@
 use std::{
-    marker::PhantomData, pin::Pin, sync::{
-        atomic::{AtomicPtr, Ordering},
-        Arc, Condvar, Mutex,
-    }
+    future::poll_fn,
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    task::{Poll, Waker},
 };
 
-use futures::{task, Stream};
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 
 use crate::error::*;
 use crate::event_record::EventRecord;
 use crate::processtrace::*;
 
-struct EtwEventStreamInner {
-    waker: Mutex<Option<task::Waker>>,
-    next_event: Mutex<AtomicPtr<EVENT_RECORD>>,
-    consumer_complete: Arc<Condvar>,
+enum Slot {
+    /// No event pending. The ETW thread is free to deliver the next one.
+    Empty,
+    /// The ETW callback has published an event and is blocked until it is released.
+    Ready(*const EVENT_RECORD),
+    /// The event has been lent to the caller of `next()`; the ETW callback is still blocked.
+    Lent,
+    /// ProcessTrace has returned; no more events will be delivered.
+    Complete,
 }
 
-impl EventConsumer for EtwEventStreamConsumer{
+struct State {
+    slot: Slot,
+    waker: Option<Waker>,
+    stream_dropped: bool,
+}
+
+// SAFETY: the raw pointer in `Slot` is only dereferenced by the stream while the
+// ETW callback thread that owns it is blocked waiting for the slot to be released.
+unsafe impl Send for State {}
+
+struct Shared {
+    state: Mutex<State>,
+    released: Condvar,
+}
+
+impl Shared {
+    // Never let a poisoned lock turn into a panic on the ETW callback thread (which aborts).
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+struct EtwEventStreamConsumer {
+    shared: Arc<Shared>,
+}
+
+impl EventConsumer for EtwEventStreamConsumer {
     unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), windows::core::Error> {
-        let mut guard = self.inner.next_event.lock().unwrap();
-        if !guard.load(Ordering::Acquire).is_null() {
-            let res = self.inner.consumer_complete.wait(guard);
-            if let Ok(x) = res {
-                guard = x;
-            } else {
-                return Err(E_UNEXPECTED.into());
+        let waker = {
+            let mut state = self.shared.lock();
+            if state.stream_dropped {
+                return Err(E_CANCELLED.into());
             }
+            state.slot = Slot::Ready(evt);
+            state.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
         }
 
-        guard.store(evt, Ordering::Release);
-        if let Some(w) = &*self.inner.waker.lock().unwrap() {
-            w.wake_by_ref();
-        }
+        // `evt` is only valid until this callback returns, so block until the
+        // stream has released it (or the stream has been dropped).
+        let state = self.shared.lock();
+        let mut state = self
+            .shared
+            .released
+            .wait_while(state, |s| {
+                matches!(s.slot, Slot::Ready(_) | Slot::Lent) && !s.stream_dropped
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        state.slot = Slot::Empty;
 
         Ok(())
     }
 
     fn complete(&self, _err: windows::core::Error) {
-        unsafe {
-            let _ = self.on_event_raw(12345 as *mut EVENT_RECORD);
+        let waker = {
+            let mut state = self.shared.lock();
+            state.slot = Slot::Complete;
+            state.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 }
 
-impl<'evt> Stream for EtwEventAsyncStream<'evt> {
-    type Item = EventRecord<'evt>;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> task::Poll<Option<Self::Item>> {
-        *self.inner.waker.lock().unwrap() = Some(cx.waker().clone());
-        let guard = self.inner.next_event.lock().unwrap();
-        let evt_ptr = guard.load(Ordering::Acquire);
-        if evt_ptr.is_null() {
-            task::Poll::Pending
-        } else if evt_ptr == (12345 as *mut EVENT_RECORD) {
-            task::Poll::Ready(None)
-        } else {
-            guard.store(core::ptr::null_mut(), Ordering::Release);
-            let evt = unsafe { &*evt_ptr };
-            let result = task::Poll::Ready(Some(EventRecord::from_ref(evt)));
-            self.inner.consumer_complete.notify_all();
-            result
-        }
-    }
+/// A lending async stream of ETW events.
+///
+/// Each event returned by [`next`](Self::next) borrows the stream mutably, and the
+/// ETW callback thread stays blocked until that borrow ends. Holding an event
+/// across the next call to `next()` is therefore a compile error:
+///
+/// ```compile_fail
+/// # async fn f(stream: &mut etw_helpers::event_consumer_async::EtwEventAsyncStream) {
+/// let first = stream.next().await;
+/// let second = stream.next().await; // error[E0499]: cannot borrow `*stream` as mutable more than once
+/// drop(first);
+/// # }
+/// ```
+pub struct EtwEventAsyncStream {
+    shared: Arc<Shared>,
+    consumer: Option<EtwEventStreamConsumer>,
 }
 
-pub struct EtwEventStreamConsumer {
-    inner: Arc<EtwEventStreamInner>,
-}
-
-pub struct EtwEventAsyncStream<'evt> {
-    inner: Arc<EtwEventStreamInner>,
-    _p: PhantomData<&'evt bool>
-}
-
-impl Default for EtwEventAsyncStream<'_> {
+impl Default for EtwEventAsyncStream {
     fn default() -> Self {
-        EtwEventAsyncStream {
-            inner: Arc::new(EtwEventStreamInner {
-                waker: Mutex::new(None),
-                next_event: Mutex::new(AtomicPtr::new(core::ptr::null_mut())),
-                consumer_complete: Arc::default(),
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                slot: Slot::Empty,
+                waker: None,
+                stream_dropped: false,
             }),
-            _p: PhantomData,
+            released: Condvar::new(),
+        });
+        EtwEventAsyncStream {
+            consumer: Some(EtwEventStreamConsumer {
+                shared: shared.clone(),
+            }),
+            shared,
         }
     }
 }
 
-impl EtwEventAsyncStream<'_> {
-    pub fn get_consumer(&self) -> impl EventConsumer {
-        EtwEventStreamConsumer {
-            inner: self.inner.clone(),
+impl EtwEventAsyncStream {
+    /// Returns the [`EventConsumer`] to pass to [`ProcessTraceHandle`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once; the stream supports a single producer.
+    pub fn get_consumer(&mut self) -> impl EventConsumer + use<> {
+        self.consumer.take().unwrap()
+    }
+
+    /// Waits for the next event. Returns `None` once ProcessTrace has completed.
+    ///
+    /// The returned event borrows `self`, so it must be dropped before calling `next()` again.
+    pub async fn next(&mut self) -> Option<EventRecord<'_>> {
+        // Requiring `&mut self` guarantees any previously returned event is no longer referenced.
+        self.release_current();
+
+        let ptr = poll_fn(|cx| {
+            let mut state = self.shared.lock();
+            match state.slot {
+                Slot::Ready(p) => {
+                    state.slot = Slot::Lent;
+                    Poll::Ready(Some(p))
+                }
+                Slot::Complete => Poll::Ready(None),
+                Slot::Empty => {
+                    match &mut state.waker {
+                        Some(w) if w.will_wake(cx.waker()) => {}
+                        w => *w = Some(cx.waker().clone()),
+                    }
+                    Poll::Pending
+                }
+                Slot::Lent => unreachable!("previous event was released above"),
+            }
+        })
+        .await?;
+
+        // SAFETY: the ETW callback that owns `ptr` is blocked until the slot leaves `Lent`,
+        // which only happens in `release_current` (requires `&mut self`, ending this borrow)
+        // or in `Drop`.
+        Some(EventRecord::from_ref(unsafe { &*ptr }))
+    }
+
+    fn release_current(&mut self) {
+        let mut state = self.shared.lock();
+        if let Slot::Lent = state.slot {
+            state.slot = Slot::Empty;
+            drop(state);
+            self.shared.released.notify_one();
         }
+    }
+}
+
+impl Drop for EtwEventAsyncStream {
+    fn drop(&mut self) {
+        self.shared.lock().stream_dropped = true;
+        self.shared.released.notify_one();
     }
 }
 
@@ -103,7 +189,6 @@ impl EtwEventAsyncStream<'_> {
 #[allow(non_upper_case_globals)]
 mod tests {
     use crate::{FileMode, SessionBuilder};
-    use futures::StreamExt;
 
     use super::*;
 
@@ -121,41 +206,49 @@ mod tests {
         let provider_guid = windows::core::GUID::from_u128(provider.id().to_u128());
         let mut eb = tracelogging_dynamic::EventBuilder::new();
 
-        let h = SessionBuilder::new_file_mode(
-            "EtwConsumer-Rust-Tests-StreamEvent",
-            "strm.etl",
-            FileMode::Sequential,
-        )
-        .realtime_event_delivery()
-        .start(true)?;
+        let h = SessionBuilder::new_file_mode(test_name, "strm.etl", FileMode::Sequential)
+            .realtime_event_delivery()
+            .start(true)?;
 
         h.enable_provider(&provider_guid, 0xFF)?;
 
-        let etw_event_stream = EtwEventAsyncStream::default();
+        let mut etw_event_stream = EtwEventAsyncStream::default();
         let event_consumer = etw_event_stream.get_consumer();
 
         let trace = ProcessTraceHandle::from_session(test_name, event_consumer)?;
 
         let mut thread = trace.process_trace()?;
 
-        let mut events = etw_event_stream.enumerate().fuse();
-
         eb.write(&provider, None, None);
         eb.write(&provider, None, None);
         eb.write(&provider, None, None);
 
         let mut process_trace_thread = None;
-        let mut count = 0;
-        while let Some(_evt) = events.next().await {
-            count += 1;
-            println!("Yay! {count}");
+        let mut kept = Vec::new();
+        while let Some(evt) = etw_event_stream.next().await {
+            assert_eq!(evt.get_event_header().ProviderId, provider_guid);
+            let ext_count = evt.get_extended_data_items().count();
 
-            if count == 3 {
+            let serialized = EventRecord::from_serialized(evt.serialize())?;
+            assert_eq!(serialized.get_event_header().ProviderId, provider_guid);
+            assert_eq!(serialized.get_user_data(), evt.get_user_data());
+            assert_eq!(serialized.get_extended_data_items().count(), ext_count);
+
+            kept.push((ext_count, evt.into_owned()));
+
+            if kept.len() == 3 {
                 process_trace_thread = Some(thread.stop_and_get_thread());
             }
         }
 
         let _ = process_trace_thread.expect("x")?.join(); // We don't care about what ProcessTrace returned
+
+        assert_eq!(kept.len(), 3);
+        for (ext_count, evt) in kept {
+            assert!(ext_count > 0, "TraceLogging events carry schema extended data");
+            assert_eq!(evt.get_event_header().ProviderId, provider_guid);
+            assert_eq!(evt.get_extended_data_items().count(), ext_count);
+        }
 
         Ok(())
     }

@@ -2,6 +2,58 @@ use std::{borrow::Cow, mem::ManuallyDrop};
 
 use windows::{core::PCWSTR, Win32::System::Diagnostics::Etw::*};
 
+/// Gets a handle to an already-running ETW session by name.
+///
+/// The returned handle **stops the session when dropped**; call
+/// [`ControlTraceHandle::manual_stop`] to leave it running.
+///
+/// # Panics
+///
+/// Panics if `session_name` is 1024 or more UTF-16 code units long.
+pub fn get_existing_session(
+    session_name: &str
+) -> Result<ControlTraceHandle, windows::core::Error> {
+    let mut wsz_session_name: [u16; 1024] = [0; 1024];
+    if !session_name.is_empty() {
+        let name_utf16 = session_name.encode_utf16();
+
+        let mut i = 0;
+        for c in name_utf16 {
+            wsz_session_name[i] = c;
+            i += 1;
+
+            if i >= 1024 {
+                panic!();
+            }
+        }
+
+        wsz_session_name[i] = 0; // nul-terminate
+    }
+
+    wsz_get_existing_session(PCWSTR(wsz_session_name.as_ptr()))
+}
+
+fn wsz_get_existing_session(
+    wsz_session_name: PCWSTR
+) -> Result<ControlTraceHandle, windows::core::Error> {
+    unsafe {
+        let mut properties = EventTraceProperties::empty_for_query();
+        let err = ControlTraceW(
+            CONTROLTRACE_HANDLE::default(),
+            wsz_session_name,
+            &mut properties.props,
+            EVENT_TRACE_CONTROL_QUERY,
+        );
+        if err.is_err() {
+            Err(err.into())
+        } else {
+            Ok(ControlTraceHandle(CONTROLTRACE_HANDLE {
+                Value: properties.props.Wnode.Anonymous1.HistoricalContext,
+        }))
+        }
+    }
+}
+
 #[repr(C)]
 pub struct EventTraceProperties {
     props: EVENT_TRACE_PROPERTIES,
@@ -10,20 +62,29 @@ pub struct EventTraceProperties {
 }
 
 impl EventTraceProperties {
+    // Byte offsets of the inline name buffers, as ETW expects in LoggerNameOffset/LogFileNameOffset
+    const SESSION_NAME_OFFSET: u32 = core::mem::offset_of!(EventTraceProperties, session_name) as u32;
+    const FILE_NAME_OFFSET: u32 = core::mem::offset_of!(EventTraceProperties, file_name) as u32;
+
     fn empty_for_query() -> EventTraceProperties {
         unsafe {
             let mut props: EventTraceProperties = core::mem::zeroed();
             props.props.Wnode.BufferSize = core::mem::size_of::<Self>() as u32;
             props.props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
 
-            props.props.LoggerNameOffset = core::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-            props.props.LogFileNameOffset =
-                core::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32 + 1024;
+            props.props.LoggerNameOffset = Self::SESSION_NAME_OFFSET;
+            props.props.LogFileNameOffset = Self::FILE_NAME_OFFSET;
 
             props
         }
     }
 
+    /// Copies `session_name` into the inline logger name buffer, nul-terminated.
+    /// An empty name leaves the properties unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `session_name` is 1024 or more UTF-16 code units long.
     pub fn set_session_name(&mut self, session_name: &str) -> &mut Self {
         if !session_name.is_empty() {
             let name_utf16 = session_name.encode_utf16();
@@ -40,12 +101,18 @@ impl EventTraceProperties {
 
             self.session_name[i] = 0; // nul-terminate
 
-            self.props.LoggerNameOffset = core::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+            self.props.LoggerNameOffset = Self::SESSION_NAME_OFFSET;
         }
 
         self
     }
 
+    /// Copies `file_name` into the inline log file name buffer, nul-terminated.
+    /// An empty name leaves the properties unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `file_name` is 1024 or more UTF-16 code units long.
     pub fn set_file_name(&mut self, file_name: &str) -> &mut Self {
         if !file_name.is_empty() {
             let name_utf16 = file_name.encode_utf16();
@@ -62,7 +129,7 @@ impl EventTraceProperties {
 
             self.file_name[i] = 0; // nul-terminate
 
-            self.props.LogFileNameOffset = core::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32 + 1024;
+            self.props.LogFileNameOffset = Self::FILE_NAME_OFFSET;
         }
 
         self
@@ -77,31 +144,6 @@ impl Drop for ControlTraceHandle {
         unsafe {
             let ptr = &mut props.props as *mut EVENT_TRACE_PROPERTIES;
             let _ = StopTraceW(self.0, PCWSTR::null(), ptr);
-        }
-    }
-}
-
-pub struct EtwSession(core::marker::PhantomData<&'static bool>);
-
-impl EtwSession {
-    pub fn get_etw_session(
-        wsz_session_name: PCWSTR,
-    ) -> Result<ControlTraceHandle, windows::core::Error> {
-        unsafe {
-            let mut properties = EventTraceProperties::empty_for_query();
-            let err = ControlTraceW(
-                CONTROLTRACE_HANDLE::default(),
-                wsz_session_name,
-                &mut properties.props,
-                EVENT_TRACE_CONTROL_QUERY,
-            );
-            if err.is_err() {
-                Err(err.into())
-            } else {
-                Ok(ControlTraceHandle(CONTROLTRACE_HANDLE {
-                    Value: properties.props.Wnode.Anonymous1.HistoricalContext,
-            }))
-            }
         }
     }
 }
@@ -146,6 +188,9 @@ impl SessionMode for BufferingModeSession {}
 
 // Options only available to file mode sessions
 impl EtwSessionBuilder<FileModeSession> {
+    /// Also delivers events to real-time consumers (see
+    /// [`ProcessTraceHandle::from_session`](crate::ProcessTraceHandle::from_session))
+    /// in addition to writing them to the log file.
     pub fn realtime_event_delivery(mut self) -> Self {
         self.realtime = true;
         self
@@ -158,6 +203,8 @@ impl EtwSessionBuilder<BufferingModeSession> {}
 pub struct SessionBuilder {}
 
 impl SessionBuilder {
+    /// Creates a builder for a buffering-mode session, which keeps events in
+    /// in-memory buffers only and does not write a log file.
     pub fn new_buffering_mode(session_name: &str) -> EtwSessionBuilder<BufferingModeSession> {
         let mut builder = EtwSessionBuilder::create(session_name);
         builder.log_file_mode = LogFileMode::Buffering;
@@ -165,6 +212,7 @@ impl SessionBuilder {
         builder
     }
 
+    /// Creates a builder for a session that logs events to `file_name` using `file_mode`.
     pub fn new_file_mode(
         session_name: &str,
         file_name: &str,
@@ -200,11 +248,13 @@ where
         }
     }
 
+    /// Sets the size of each session buffer in kilobytes. Defaults to 64.
     pub fn buffer_size_kb(mut self, buffer_size_in_kilobytes: u16) -> Self {
         self.buffer_size = buffer_size_in_kilobytes;
         self
     }
 
+    /// Sets the minimum, initial, and maximum number of session buffers. Each defaults to 2.
     pub fn buffer_counts(
         mut self,
         minimum_buffer_count: u16,
@@ -217,11 +267,22 @@ where
         self
     }
 
+    /// Allocates session buffers from the nonpaged pool instead of the default paged pool.
+    ///
+    /// Required for sessions that receive events from kernel-mode providers, which
+    /// cannot log to paged-memory sessions.
     pub fn nonpaged_pool(mut self) -> Self {
         self.nonpaged = true;
         self
     }
 
+    /// Starts the session.
+    ///
+    /// If `recreate_existing_session` is true, any running session with the same name is
+    /// stopped first; otherwise starting fails if the name is already in use.
+    ///
+    /// The returned handle **stops the session when dropped**; call
+    /// [`ControlTraceHandle::manual_stop`] to leave it running.
     pub fn start(
         self,
         recreate_existing_session: bool,
@@ -262,6 +323,10 @@ where
             properties.props.LogFileNameOffset = 0;
         }
 
+        if !self.nonpaged {
+            log_file_mode |= EVENT_TRACE_USE_PAGED_MEMORY;
+        }
+
         properties.props = EVENT_TRACE_PROPERTIES {
             Wnode: WNODE_HEADER {
                 ClientContext: 1,
@@ -282,7 +347,7 @@ where
         unsafe {
             if recreate_existing_session {
                 let existing_session =
-                    EtwSession::get_etw_session(PCWSTR(properties.session_name.as_ptr()));
+                    wsz_get_existing_session(PCWSTR(properties.session_name.as_ptr()));
                 if existing_session.is_ok() {
                     // Stop existing session
                     drop(existing_session);
@@ -313,10 +378,14 @@ where
 }
 
 impl ControlTraceHandle {
+    /// Prevents the session from being stopped when the handle is dropped, so it
+    /// keeps running after this process is done with it.
     pub fn manual_stop(self) -> ManuallyDrop<Self> {
         ManuallyDrop::new(self)
     }
 
+    /// Enables the provider with GUID `provider_id` in this session, for events at or below
+    /// `level` (e.g. `0xFF` for all levels). No keyword filtering is applied.
     pub fn enable_provider(
         &self,
         provider_id: &windows::core::GUID,
@@ -341,6 +410,7 @@ impl ControlTraceHandle {
         }
     }
 
+    /// Disables the provider with GUID `provider_id` in this session.
     pub fn disable_provider(
         &self,
         provider_id: &windows::core::GUID,
@@ -362,5 +432,51 @@ impl ControlTraceHandle {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+mod tests {
+    use super::*;
+
+    fn query_log_file_mode(session_name: &str) -> Result<u32, windows::core::Error> {
+        let mut properties = EventTraceProperties::empty_for_query();
+        properties.set_session_name(session_name);
+        unsafe {
+            ControlTraceW(
+                CONTROLTRACE_HANDLE::default(),
+                PCWSTR(properties.session_name.as_ptr()),
+                &mut properties.props,
+                EVENT_TRACE_CONTROL_QUERY,
+            )
+        }
+        .ok()?;
+
+        Ok(properties.props.LogFileMode)
+    }
+
+    #[test]
+    fn paged_pool_by_default() -> Result<(), windows::core::Error> {
+        const test_name: &str = "EtwSession-Rust-Tests-Paged";
+
+        let _h = SessionBuilder::new_buffering_mode(test_name).start(true)?;
+
+        assert_ne!(query_log_file_mode(test_name)? & EVENT_TRACE_USE_PAGED_MEMORY, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn nonpaged_pool() -> Result<(), windows::core::Error> {
+        const test_name: &str = "EtwSession-Rust-Tests-Nonpaged";
+
+        let _h = SessionBuilder::new_buffering_mode(test_name)
+            .nonpaged_pool()
+            .start(true)?;
+
+        assert_eq!(query_log_file_mode(test_name)? & EVENT_TRACE_USE_PAGED_MEMORY, 0);
+
+        Ok(())
     }
 }

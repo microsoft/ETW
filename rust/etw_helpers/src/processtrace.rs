@@ -59,7 +59,7 @@ where
         if stop {
             Ok(())
         } else {
-            <C as EventConsumer>::on_event_raw(&self.consumer, event_record)
+            unsafe { <C as EventConsumer>::on_event_raw(&self.consumer, event_record) }
         }
     }
 
@@ -71,7 +71,7 @@ where
 
 /// A wrapper around the Win32 OpenTrace function.
 /// Opens an ETW session, either for an existing real-time session or
-/// for a file. Does not start processing events until [process_trace] is called.
+/// for a file. Does not start processing events until [`process_trace`](Self::process_trace) is called.
 pub struct ProcessTraceHandle<C>
 where
     C: EventConsumer + 'static,
@@ -86,10 +86,20 @@ impl<C> ProcessTraceHandle<C>
 where
     C: EventConsumer + 'static,
 {
+    /// Opens the running real-time session `session_name`, delivering its events to `consumer`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `session_name` is empty or 1024 or more UTF-16 code units long.
     pub fn from_session(session_name: &str, consumer: C) -> Result<Self, windows::core::Error> {
         Self::create(session_name, false, consumer)
     }
 
+    /// Opens the `.etl` log file `file_name`, delivering its events to `consumer`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `file_name` is empty or 1024 or more UTF-16 code units long.
     pub fn from_file(file_name: &str, consumer: C) -> Result<Self, windows::core::Error> {
         Self::create(file_name, true, consumer)
     }
@@ -113,8 +123,11 @@ where
                 }
 
                 let mut props: EventTraceLogFile = core::mem::zeroed();
-                props.props.Anonymous1.ProcessTraceMode =
-                    PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_REAL_TIME;
+                props.props.Anonymous1.ProcessTraceMode = if is_file {
+                    PROCESS_TRACE_MODE_EVENT_RECORD
+                } else {
+                    PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_REAL_TIME
+                };
                 props.props.Anonymous2.EventRecordCallback = Some(Self::event_record_callback);
 
                 let name_utf16 = name.encode_utf16();
@@ -162,15 +175,16 @@ where
 
     // This function is a member of ProcessTraceHandle because it needs to know type `C`
     unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD) {
-        let ctx: *mut CallbackThreadData<C> = core::ptr::with_exposed_provenance_mut((*event_record).UserContext as usize);
+        let ctx: *mut CallbackThreadData<C> = core::ptr::with_exposed_provenance_mut(unsafe { (*event_record).UserContext as usize });
         if !ctx.is_null() {
             // It's not safe to let a panic cross back into C code.
             // Use AssertUnwindSafe because we will always abort in the event of a panic.
             let err = catch_unwind(AssertUnwindSafe(|| {
-                let result = (*ctx).inner_callback(event_record);
+                let ctx = unsafe { &*ctx };
+                let result = unsafe { ctx.inner_callback(event_record) };
                 if result.is_err() {
-                    (*ctx).shared_data.stop_callbacks.store(true, Ordering::Release);
-                    let _ = CloseTrace(PROCESSTRACE_HANDLE{Value: (*ctx).shared_data.session_handle.load(Ordering::Acquire)});
+                    ctx.shared_data.stop_callbacks.store(true, Ordering::Release);
+                    let _ = unsafe { CloseTrace(PROCESSTRACE_HANDLE{Value: ctx.shared_data.session_handle.load(Ordering::Acquire)}) };
                 }
             }));
             if err.is_err() {
@@ -179,6 +193,9 @@ where
         }
     }
 
+    /// Starts a thread that runs ProcessTrace, calling the consumer for each event on that thread.
+    ///
+    /// The returned [`ProcessTraceThread`] stops the trace when dropped.
     pub fn process_trace(self) -> Result<ProcessTraceThread, windows::core::Error> {
         let thread = spawn_process_trace_thread(self.callback_data);
 
@@ -222,6 +239,13 @@ pub struct ProcessTraceThread
 
 impl ProcessTraceThread
 {
+    /// Closes the trace and blocks until the ProcessTrace thread exits.
+    ///
+    /// The thread cannot exit while the consumer's callback is blocked, so release or drop any
+    /// event waiter first. ProcessTrace's own result is discarded; use
+    /// [`stop_and_get_thread`](Self::stop_and_get_thread) to observe it.
+    ///
+    /// Returns `E_UNEXPECTED` if the trace was already stopped or the thread panicked.
     pub fn stop_and_wait(&mut self) -> Result<(), windows::core::Error> {
         match self.stop_and_get_thread() {
             Ok(t) => {
@@ -234,6 +258,11 @@ impl ProcessTraceThread
         }
     }
 
+    /// Closes the trace without waiting and returns the ProcessTrace thread, whose result is
+    /// ProcessTrace's result. For real-time sessions, events already buffered are still
+    /// delivered before the thread exits.
+    ///
+    /// Returns `E_UNEXPECTED` if the trace was already stopped.
     pub fn stop_and_get_thread(&mut self) -> Result<JoinHandle<Result<(), windows::core::Error>>, windows::core::Error> {
         if let Some(t) = self.thread.take() {
             self.inner.close_trace(false);
@@ -254,7 +283,98 @@ impl Drop for ProcessTraceThread {
 }
 
 pub trait EventConsumer : Send + Sync {
+    /// Called on the ProcessTrace thread for each event.
+    ///
+    /// # Safety
+    ///
+    /// `evt` must point to a valid `EVENT_RECORD` that remains valid until this call returns.
+    /// Implementations must not let `evt`, or anything borrowed from it, outlive the call.
     unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), windows::core::Error>;
 
+    /// Called once on the ProcessTrace thread after ProcessTrace returns, with its result.
+    /// No more events will be delivered. The default does nothing.
     fn complete(&self, _err: windows::core::Error) {}
+}
+
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    use crate::{FileMode, SessionBuilder};
+
+    use super::*;
+
+    struct CountingConsumer {
+        provider_id: windows::core::GUID,
+        count: Arc<AtomicUsize>,
+        done: Arc<rsevents::ManualResetEvent>,
+    }
+
+    impl EventConsumer for CountingConsumer {
+        unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), windows::core::Error> {
+            if unsafe { (*evt).EventHeader.ProviderId } == self.provider_id {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn complete(&self, _err: windows::core::Error) {
+            self.done.set();
+        }
+    }
+
+    #[test]
+    fn from_file() -> Result<(), windows::core::Error> {
+        const test_name: &str = "EtwConsumer-Rust-Tests-FromFile";
+        const file_name: &str = "ff.etl";
+
+        let provider = Box::pin(tracelogging_dynamic::Provider::new(
+            "from_file_test",
+            &tracelogging_dynamic::Provider::options(),
+        ));
+        unsafe {
+            provider.as_ref().register();
+        }
+        let provider_id = windows::core::GUID::from_u128(provider.id().to_u128());
+
+        {
+            let h = SessionBuilder::new_file_mode(test_name, file_name, FileMode::Sequential)
+                .start(true)?;
+            h.enable_provider(&provider_id, 0xFF)?;
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !provider.enabled(tracelogging::Level::LogAlways, 0) {
+                assert!(Instant::now() < deadline, "provider was never enabled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            let mut eb = tracelogging_dynamic::EventBuilder::new();
+            eb.reset("test event", tracelogging::Level::LogAlways, 1, 0);
+            for _ in 0..3 {
+                assert_eq!(eb.write(&provider, None, None), 0);
+            }
+        } // Dropping the handle stops the session, flushing and closing the file
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(rsevents::ManualResetEvent::new(rsevents::EventState::Unset));
+        let trace = ProcessTraceHandle::from_file(
+            file_name,
+            CountingConsumer {
+                provider_id,
+                count: count.clone(),
+                done: done.clone(),
+            },
+        )?;
+        let mut thread = trace.process_trace()?;
+
+        // ProcessTrace returns on its own at the end of the file
+        assert!(done.wait_for(Duration::from_secs(10)), "ProcessTrace did not finish");
+        let _ = thread.stop_and_wait();
+
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+
+        Ok(())
+    }
 }
