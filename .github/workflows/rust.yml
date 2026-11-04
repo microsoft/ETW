@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +16,7 @@ jobs:
       run:
         working-directory: ./rust/etw_helpers
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
         run: cargo build --verbose
       - name: Build without std
@@ -31,6 +31,6 @@ jobs:
       run:
         working-directory: ./rust/etw_helpers
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
         run: cargo build --verbose

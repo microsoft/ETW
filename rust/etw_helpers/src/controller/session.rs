@@ -151,9 +151,16 @@ impl Drop for ControlTraceHandle {
 // These values are all mutually exclusive
 pub enum FileMode {
     Sequential,
-    Circular,
+    /// Overwrites the oldest events once the file reaches `maximum_file_size_in_kilobytes`.
+    Circular {
+        maximum_file_size_in_kilobytes: u32,
+    },
     //Append, // Nobody should or does use this, so we're not going to implement it
-    NewFile { maximum_file_size_in_kilobytes: u32 },
+    /// Starts a new file each time the current one reaches `maximum_file_size_in_kilobytes`.
+    /// The file name must contain a `%d` format specifier.
+    NewFile {
+        maximum_file_size_in_kilobytes: u32,
+    },
 }
 
 pub enum LogFileMode {
@@ -168,7 +175,6 @@ pub struct EtwSessionBuilder<FM> {
     buffer_size: u16,
     min_buffers: u16,
     max_buffers: u16,
-    num_buffers: u16,
     _maximum_file_size_in_kilobytes: u32,
     log_file_mode: LogFileMode,
     nonpaged: bool,
@@ -238,7 +244,6 @@ where
             buffer_size: 64,
             min_buffers: 2,
             max_buffers: 2,
-            num_buffers: 2,
             _maximum_file_size_in_kilobytes: 0,
             log_file_mode: LogFileMode::Buffering,
             nonpaged: false,
@@ -254,15 +259,12 @@ where
         self
     }
 
-    /// Sets the minimum, initial, and maximum number of session buffers. Each defaults to 2.
-    pub fn buffer_counts(
-        mut self,
-        minimum_buffer_count: u16,
-        starting_buffer_count: u16,
-        maximum_buffer_count: u16,
-    ) -> Self {
+    /// Sets the minimum and maximum number of session buffers. Each defaults to 2.
+    ///
+    /// ETW allocates the minimum number of buffers when the session starts, and adds more, up to
+    /// the maximum, as needed.
+    pub fn buffer_counts(mut self, minimum_buffer_count: u16, maximum_buffer_count: u16) -> Self {
         self.min_buffers = minimum_buffer_count;
-        self.num_buffers = starting_buffer_count;
         self.max_buffers = maximum_buffer_count;
         self
     }
@@ -300,7 +302,10 @@ where
 
         if let LogFileMode::File(file_mode) = self.log_file_mode {
             match file_mode {
-                FileMode::Circular => {
+                FileMode::Circular {
+                    maximum_file_size_in_kilobytes: kb,
+                } => {
+                    max_file_size = kb;
                     log_file_mode = EVENT_TRACE_FILE_MODE_CIRCULAR;
                 }
                 FileMode::Sequential => {
@@ -312,6 +317,11 @@ where
                     max_file_size = kb;
                     log_file_mode = EVENT_TRACE_FILE_MODE_NEWFILE;
                 }
+            }
+
+            // MaximumFileSize is in megabytes unless this flag is set.
+            if max_file_size != 0 {
+                log_file_mode |= EVENT_TRACE_USE_KBYTES_FOR_SIZE;
             }
 
             properties.set_file_name(&self.file_name);
@@ -338,7 +348,6 @@ where
             MinimumBuffers: self.min_buffers as u32,
             MaximumBuffers: self.max_buffers as u32,
             LogFileMode: log_file_mode,
-            NumberOfBuffers: self.num_buffers as u32,
             FlushTimer: 1,
             MaximumFileSize: max_file_size,
 
@@ -478,6 +487,29 @@ mod tests {
 
         assert_eq!(
             query_log_file_mode(test_name)? & EVENT_TRACE_USE_PAGED_MEMORY,
+            0
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn circular_file() -> Result<(), crate::Error> {
+        const test_name: &str = "EtwSession-Rust-Tests-Circular";
+        let file_name = crate::test_util::etl_path("circular.etl");
+
+        // ETW rejects a circular log file without a maximum size.
+        let _h = SessionBuilder::new_file_mode(
+            test_name,
+            &file_name,
+            FileMode::Circular {
+                maximum_file_size_in_kilobytes: 1024,
+            },
+        )
+        .start(true)?;
+
+        assert_ne!(
+            query_log_file_mode(test_name)? & EVENT_TRACE_FILE_MODE_CIRCULAR,
             0
         );
 

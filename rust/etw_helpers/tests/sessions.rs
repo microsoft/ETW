@@ -1,9 +1,6 @@
 #[cfg(test)]
 mod functional {
-    use etw_helpers::controller::SessionBuilder;
-
-    #[allow(overflowing_literals)]
-    static E_ACCESSDENIED: windows_sys::core::HRESULT = 0x80070005;
+    use etw_helpers::controller::{SessionBuilder, get_existing_session};
 
     #[test]
     fn create_session() -> Result<(), etw_helpers::Error> {
@@ -14,17 +11,15 @@ mod functional {
 
     #[test]
     fn get_session() -> Result<(), etw_helpers::Error> {
-        let access_denied = etw_helpers::Error::from_hresult(E_ACCESSDENIED);
-        let res = etw_helpers::controller::get_existing_session("Eventlog-Application");
-        match res {
-            Ok(_) => Ok(()),
-            Err(x) => {
-                if x == access_denied {
-                    Ok(())
-                } else {
-                    Err(x)
-                }
-            }
-        }
+        const SESSION_NAME: &str = "EtwSession-Rust-Tests-Get";
+
+        // A session of our own: the handle `get_existing_session` returns would stop a system
+        // session such as Eventlog-Application when dropped.
+        let _h = SessionBuilder::new_buffering_mode(SESSION_NAME).start(true)?;
+
+        // `_h` stops the session.
+        let _existing = get_existing_session(SESSION_NAME)?.manual_stop();
+
+        Ok(())
     }
 }

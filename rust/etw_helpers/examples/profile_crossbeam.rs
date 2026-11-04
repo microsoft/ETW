@@ -67,7 +67,7 @@ fn start_session(
         FileMode::Sequential,
     )
     .buffer_size_kb(512)
-    .buffer_counts(32, 32, 64)
+    .buffer_counts(32, 64)
     .realtime_event_delivery()
     .start(true)?;
     session.enable_provider(&provider_guid, 0xFF)?;

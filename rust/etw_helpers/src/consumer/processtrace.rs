@@ -5,7 +5,6 @@ extern crate std;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ffi::c_void;
-use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
@@ -69,7 +68,7 @@ where
     C: EventProcessor + 'static,
 {
     processor: C,
-    shared_data: ManuallyDrop<Arc<SharedThreadData>>,
+    shared_data: Arc<SharedThreadData>,
 }
 
 impl<C> CallbackThreadData<C>
@@ -102,8 +101,9 @@ pub struct ProcessTraceHandle<C>
 where
     C: EventProcessor + 'static,
 {
-    // When the thread is started, this will be moved to the thread's ownership
-    callback_data: Box<CallbackThreadData<C>>,
+    // Moved to the ProcessTrace thread by `process_trace`. While it's still here, dropping the
+    // handle closes the trace.
+    callback_data: Option<Box<CallbackThreadData<C>>>,
     // Shared between the callback thread and the owning handle
     shared_data: Arc<SharedThreadData>,
 }
@@ -141,7 +141,7 @@ where
 
             let callback_data = Box::new(CallbackThreadData {
                 processor,
-                shared_data: ManuallyDrop::new(shared_data.clone()),
+                shared_data: shared_data.clone(),
             });
 
             let mut log = {
@@ -171,12 +171,6 @@ where
 
                 props.name[i] = 0; // nul-terminate
 
-                if is_file {
-                    props.props.LogFileName = props.name.as_mut_ptr();
-                } else {
-                    props.props.LoggerName = props.name.as_mut_ptr();
-                }
-
                 // Cast through usize so tools can (potentially, in the future) track and understand
                 // that the pointer we get back in the callback matches the exposed provenance.
                 let x = &*callback_data;
@@ -187,8 +181,16 @@ where
                 props
             };
 
+            // Only now that `log` is in its final location do pointers into it stay valid.
+            if is_file {
+                log.props.LogFileName = log.name.as_mut_ptr();
+            } else {
+                log.props.LoggerName = log.name.as_mut_ptr();
+            }
+
             let hndl = OpenTraceW(&mut log.props);
             if hndl.Value == u64::MAX {
+                // Read before `callback_data` and `shared_data` are dropped.
                 Err(crate::Error::from_win32(GetLastError()))
             } else {
                 // Ordering::Relaxed, because we haven't spawned any threads yet
@@ -196,7 +198,7 @@ where
                     .session_handle
                     .store(hndl.Value, Ordering::Relaxed);
                 Ok(ProcessTraceHandle {
-                    callback_data,
+                    callback_data: Some(callback_data),
                     shared_data,
                 })
             }
@@ -221,8 +223,11 @@ where
     /// Starts a thread that runs ProcessTrace, calling the processor for each event on that thread.
     ///
     /// The returned [`ProcessTraceThread`] stops the trace when dropped.
-    pub fn process_trace(self) -> Result<ProcessTraceThread, crate::Error> {
-        let thread = spawn_process_trace_thread(self.callback_data);
+    pub fn process_trace(mut self) -> Result<ProcessTraceThread, crate::Error> {
+        let Some(callback_data) = self.callback_data.take() else {
+            return Err(crate::Error::from_hresult(crate::error::E_UNEXPECTED));
+        };
+        let thread = spawn_process_trace_thread(callback_data);
 
         Ok(ProcessTraceThread {
             thread: Some(thread),
@@ -231,14 +236,27 @@ where
     }
 }
 
+/// Dropping a handle that was never passed to [`process_trace`](ProcessTraceHandle::process_trace)
+/// closes the trace.
+impl<C> Drop for ProcessTraceHandle<C>
+where
+    C: EventProcessor + 'static,
+{
+    fn drop(&mut self) {
+        if self.callback_data.is_some() {
+            self.shared_data.close_trace();
+        }
+    }
+}
+
 fn spawn_process_trace_thread<C>(
-    mut callback_data: Box<CallbackThreadData<C>>,
+    callback_data: Box<CallbackThreadData<C>>,
 ) -> JoinHandle<Result<(), crate::Error>>
 where
     C: EventProcessor + 'static,
 {
-    let shared_data = unsafe { ManuallyDrop::take(&mut callback_data.shared_data) };
-    // callback_data.shared_data is now moved and must not be used beyond this point
+    // The callbacks keep using `callback_data.shared_data`, so the thread takes its own reference.
+    let shared_data = callback_data.shared_data.clone();
     let data = Box::into_pin(callback_data);
     let handles = [PROCESSTRACE_HANDLE {
         Value: shared_data.session_handle.load(Ordering::Acquire),

@@ -1,4 +1,0 @@
-/target
-/Cargo.lock
-# Test output
-*.etl
