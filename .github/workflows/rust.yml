@@ -1,0 +1,36 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-buildtest:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ./rust/etw_helpers
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: cargo build --verbose
+      - name: Build without std
+        # Only the raw consumer: the crate is `no_std` (with `alloc`) without the `std` feature
+        run: cargo build --verbose --no-default-features
+      - name: Run tests
+        # flume isn't a default feature, so enable it (and its async APIs) to test that backend too
+        run: cargo test --verbose --features flume-async
+  linux-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./rust/etw_helpers
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: cargo build --verbose
