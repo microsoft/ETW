@@ -35,8 +35,13 @@ struct LentProcessor {
 }
 
 impl EventProcessor for LentProcessor {
-    unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), crate::Error> {
-        if self.tx.unbounded_send(AtomicPtr::new(evt)).is_err() {
+    fn on_event_raw(&self, evt: &EVENT_RECORD) -> Result<(), crate::Error> {
+        // The waiter only reads through the pointer.
+        if self
+            .tx
+            .unbounded_send(AtomicPtr::new(core::ptr::from_ref(evt).cast_mut()))
+            .is_err()
+        {
             // The waiter was dropped
             return Err(E_CANCELLED.into_error());
         }
@@ -66,8 +71,8 @@ struct OwnedProcessor {
 }
 
 impl EventProcessor for OwnedProcessor {
-    unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), crate::Error> {
-        let evt = EventRecordOwned::from_raw(unsafe { &*evt });
+    fn on_event_raw(&self, evt: &EVENT_RECORD) -> Result<(), crate::Error> {
+        let evt = EventRecordOwned::from_raw(evt);
         let mut tx = self.tx.lock().unwrap_or_else(PoisonError::into_inner);
         // Blocks while the queue is full. Fails once the waiter has been dropped.
         match tx.try_send(evt) {

@@ -51,13 +51,13 @@ struct EtwEventStreamConsumer {
 }
 
 impl EventProcessor for EtwEventStreamConsumer {
-    unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), crate::Error> {
+    fn on_event_raw(&self, evt: &EVENT_RECORD) -> Result<(), crate::Error> {
         let waker = {
             let mut state = self.shared.lock();
             if state.stream_dropped {
                 return Err(E_CANCELLED.into_error());
             }
-            state.slot = Slot::Ready(evt);
+            state.slot = Slot::Ready(core::ptr::from_ref(evt));
             state.waker.take()
         };
         if let Some(w) = waker {

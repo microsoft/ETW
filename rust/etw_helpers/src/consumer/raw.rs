@@ -44,12 +44,12 @@ struct LentProcessor {
 }
 
 impl EventProcessor for LentProcessor {
-    unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), crate::Error> {
+    fn on_event_raw(&self, evt: &EVENT_RECORD) -> Result<(), crate::Error> {
         let mut state = self.shared.lock();
         if state.waiter_dropped {
             return Err(E_CANCELLED.into_error());
         }
-        state.slot = Slot::Ready(evt);
+        state.slot = Slot::Ready(core::ptr::from_ref(evt));
         self.shared.notify_all();
 
         // `evt` is only valid until this callback returns, so wait for the waiter to release it.
@@ -245,8 +245,8 @@ struct OwnedProcessor {
 }
 
 impl EventProcessor for OwnedProcessor {
-    unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), crate::Error> {
-        let evt = EventRecordOwned::from_raw(unsafe { &*evt });
+    fn on_event_raw(&self, evt: &EVENT_RECORD) -> Result<(), crate::Error> {
+        let evt = EventRecordOwned::from_raw(evt);
 
         let mut state = self.shared.lock();
         // Blocks while the queue is full.

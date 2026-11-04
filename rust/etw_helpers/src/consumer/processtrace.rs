@@ -80,12 +80,12 @@ where
         feature = "hotpath",
         hotpath::measure(impl_type = "CallbackThreadData")
     )]
-    unsafe fn inner_callback(&self, event_record: *mut EVENT_RECORD) -> Result<(), crate::Error> {
+    fn inner_callback(&self, event_record: &EVENT_RECORD) -> Result<(), crate::Error> {
         let stop = self.shared_data.stop_callbacks.load(Ordering::Acquire);
         if stop {
             Ok(())
         } else {
-            unsafe { <C as EventProcessor>::on_event_raw(&self.processor, event_record) }
+            <C as EventProcessor>::on_event_raw(&self.processor, event_record)
         }
     }
 
@@ -207,13 +207,15 @@ where
 
     // This function is a member of ProcessTraceHandle because it needs to know type `C`
     unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD) {
+        // ETW guarantees the record is valid for the duration of the callback.
+        let evt = unsafe { &*event_record };
         let ctx: *mut CallbackThreadData<C> =
-            core::ptr::with_exposed_provenance_mut(unsafe { (*event_record).UserContext as usize });
+            core::ptr::with_exposed_provenance_mut(evt.UserContext as usize);
         // A panic can't unwind into ETW: unwinding out of an `extern "system"` function aborts
         // the process.
         if !ctx.is_null() {
             let ctx = unsafe { &*ctx };
-            let result = unsafe { ctx.inner_callback(event_record) };
+            let result = ctx.inner_callback(evt);
             if result.is_err() {
                 ctx.shared_data.cancel_trace();
             }
@@ -376,11 +378,9 @@ impl Drop for ProcessTraceThread {
 pub trait EventProcessor: Send + Sync {
     /// Called on the ProcessTrace thread for each event.
     ///
-    /// # Safety
-    ///
-    /// `evt` must point to a valid `EVENT_RECORD` that remains valid until this call returns.
-    /// Implementations must not let `evt`, or anything borrowed from it, outlive the call.
-    unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), crate::Error>;
+    /// `evt` is only valid for the duration of the call. An implementation that hands it to
+    /// another thread must block until that thread has released it.
+    fn on_event_raw(&self, evt: &EVENT_RECORD) -> Result<(), crate::Error>;
 
     /// Called once on the ProcessTrace thread after ProcessTrace returns, with its result.
     /// No more events will be delivered. The default does nothing.
@@ -404,11 +404,8 @@ mod tests {
     }
 
     impl EventProcessor for CountingConsumer {
-        unsafe fn on_event_raw(&self, evt: *mut EVENT_RECORD) -> Result<(), crate::Error> {
-            if crate::test_util::guid_eq(
-                unsafe { &(*evt).EventHeader.ProviderId },
-                &self.provider_id,
-            ) {
+        fn on_event_raw(&self, evt: &EVENT_RECORD) -> Result<(), crate::Error> {
+            if crate::test_util::guid_eq(&evt.EventHeader.ProviderId, &self.provider_id) {
                 self.count.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())

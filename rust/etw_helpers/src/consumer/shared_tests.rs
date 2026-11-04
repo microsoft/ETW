@@ -413,11 +413,11 @@ struct CallbackObserver<P> {
 }
 
 impl<P: EventProcessor> EventProcessor for CallbackObserver<P> {
-    unsafe fn on_event_raw(
+    fn on_event_raw(
         &self,
-        evt: *mut windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD,
+        evt: &windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD,
     ) -> Result<(), crate::Error> {
-        let result = unsafe { self.processor.on_event_raw(evt) };
+        let result = self.processor.on_event_raw(evt);
         let _ = self.returned.try_send(());
         result
     }
